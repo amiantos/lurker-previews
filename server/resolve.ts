@@ -40,6 +40,7 @@ import {
 import { scrapeMeta, readOEmbed, decodeBody, type OEmbedMeta } from './services/linkMeta.js';
 import { videoEmbedFor, oembedEndpointFor } from './services/linkEmbed.js';
 import { cooldownRemaining, isTransientStatus, noteRefusal } from './utils/originCooldown.js';
+import { posterForUrl, type Poster } from './poster.js';
 
 /** Clamps, applied here so no client has to think about them and no cell can be
  *  surprised by a 40 KB og:description. See the ⚠ on `clamp` for why the CELL
@@ -83,7 +84,9 @@ export interface PreviewMeta {
 }
 
 export type ResolveVerdict =
-  | { verdict: 'ok'; meta: PreviewMeta }
+  /** `poster` rides along only when it was asked for AND one could be made — a missing
+   *  poster is a complete state (a card without one), never an error. */
+  | { verdict: 'ok'; meta: PreviewMeta; poster?: Poster }
   | { verdict: 'none' }
   /** `reason` is for the CELL's log line — an SSRF refusal is either a misconfigured
    *  link or somebody probing, and the message says which. */
@@ -364,7 +367,11 @@ function backoff(host: string): ResolveVerdict {
   return { verdict: 'backoff', retryAfterS: cooldownRemaining(host) || 60 };
 }
 
-async function doResolve(raw: string, signal: AbortSignal): Promise<ResolveVerdict> {
+async function doResolve(
+  raw: string,
+  signal: AbortSignal,
+  wantPoster: boolean,
+): Promise<ResolveVerdict> {
   const url = normalizeUrl(raw);
   if (!url) return { verdict: 'refused', reason: 'disallowed or malformed URL' };
   // ⚠ Re-checked on the NORMALISED form. The cell gates the request string, but WHATWG
@@ -424,8 +431,15 @@ async function doResolve(raw: string, signal: AbortSignal): Promise<ResolveVerdi
   if (kind !== 'page') {
     const size = kind === 'image' ? await imageDimensions(res) : null;
     res.stream.destroy();
+    // ⚠ The poster is made DURING resolve, never in the background after it: the cell's
+    // clients require a card's first render to be complete or have no poster, never one
+    // then the other (the atomic-reveal rule, LINK_PREVIEWS_MEDIA_POLICY.md). Its cost is
+    // bounded by the decode deadline and paid once per URL per cell-side TTL.
+    const poster =
+      wantPoster && (kind === 'video' || kind === 'audio') ? await posterForUrl(url, signal) : null;
     return {
       verdict: 'ok',
+      ...(poster ? { poster } : {}),
       meta: {
         kind,
         title: null,
@@ -459,9 +473,13 @@ async function doResolve(raw: string, signal: AbortSignal): Promise<ResolveVerdi
  * signal that makes giving up real — an abandoned fetch keeps its socket for its own hop
  * budget, and only an ABORTED one frees the slot honestly.
  */
-export async function resolveUrl(raw: string, signal: AbortSignal): Promise<ResolveVerdict> {
+export async function resolveUrl(
+  raw: string,
+  signal: AbortSignal,
+  opts: { wantPoster?: boolean } = {},
+): Promise<ResolveVerdict> {
   try {
-    return await doResolve(raw, signal);
+    return await doResolve(raw, signal, opts.wantPoster === true);
   } catch (err) {
     // ⚠ Every UnsafeUrlError maps to `refused`, and that is the cell's CURRENT semantics, not a
     // simplification: the cell logged and FAIL_TTL'd the whole class — guard refusals and hop

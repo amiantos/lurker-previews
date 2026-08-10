@@ -12,12 +12,30 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 
+# Test stage: the full suite in the image's own environment — which is the ONLY
+# environment with ffmpeg guaranteed, so the poster tests that skip on a bare
+# dev machine run for real here. `docker build --target test .` is the gate.
+FROM node:24-slim AS test
+
+WORKDIR /app
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY package*.json ./
+RUN npm ci
+COPY tsconfig.json vitest.config.ts ./
+COPY server/ ./server/
+RUN npx vitest run
+
+# Runtime image.
 FROM node:24-slim
 
 WORKDIR /app
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends tini \
+  && apt-get install -y --no-install-recommends tini ffmpeg \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=deps /app/node_modules ./node_modules
@@ -26,8 +44,8 @@ COPY server/ ./server/
 
 # ⚠ Non-root is part of the posture, not a nicety: this process exists to run
 # memory-unsafe parsers on bytes strangers chose. The runtime flags in the
-# README (--read-only, --cap-drop ALL, --memory, --pids-limit and the egress
-# rules) are the other half; a Dockerfile cannot express them.
+# README (--read-only, --tmpfs /tmp, --cap-drop ALL, --memory, --pids-limit and
+# the egress rules) are the other half; a Dockerfile cannot express them.
 USER node
 
 EXPOSE 8030

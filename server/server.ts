@@ -97,7 +97,11 @@ export interface ServerState {
   reason: string;
 }
 
-async function handleResolve(res: ServerResponse, rawUrl: string): Promise<void> {
+async function handleResolve(
+  res: ServerResponse,
+  rawUrl: string,
+  wantPoster: boolean,
+): Promise<void> {
   if (!(await resolvePool.acquire())) {
     // Saturated is a fact about this instant — the transient TTL's whole reason.
     res.writeHead(503, { 'retry-after': '5' }).end();
@@ -106,13 +110,26 @@ async function handleResolve(res: ServerResponse, rawUrl: string): Promise<void>
   const controller = new AbortController();
   try {
     const out = await withDeadline(
-      resolveUrl(rawUrl, controller.signal),
+      resolveUrl(rawUrl, controller.signal, { wantPoster }),
       RESOLVE_DEADLINE_MS,
       'resolve',
     );
     switch (out.verdict) {
       case 'ok':
-        json(res, 200, out.meta);
+        // The poster is bytes in a JSON body, so base64 — tolerable ONLY because a poster is
+        // a ≤640px q4 JPEG (tens of KB); real image relays stream through /fetch instead.
+        json(res, 200, {
+          ...out.meta,
+          ...(out.poster
+            ? {
+                poster: {
+                  jpegBase64: out.poster.jpeg.toString('base64'),
+                  width: out.poster.width,
+                  height: out.poster.height,
+                },
+              }
+            : {}),
+        });
         return;
       case 'none':
         res.writeHead(204).end();
@@ -173,7 +190,7 @@ export function createHandler(state: ServerState) {
         res.writeHead(413).end();
         return;
       }
-      let parsed: { url?: unknown; range?: unknown };
+      let parsed: { url?: unknown; range?: unknown; wantPoster?: unknown };
       try {
         parsed = JSON.parse(body.toString('utf8')) as typeof parsed;
       } catch {
@@ -186,7 +203,7 @@ export function createHandler(state: ServerState) {
       }
 
       if (req.url === '/resolve') {
-        await handleResolve(res, parsed.url);
+        await handleResolve(res, parsed.url, parsed.wantPoster === true);
         return;
       }
       // /fetch. The range is passed through untrusted — linkFetch's RANGE_RE refuses a
