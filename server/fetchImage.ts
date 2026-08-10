@@ -261,6 +261,22 @@ export async function fetchImage(
     const head: Record<string, string> = {
       'content-type': upstream.contentType,
     };
+    // ⚠⚠ FRAMING ATTESTATION, and it exists because a relay LAUNDERS truncation. An origin
+    // body framed only by the connection closing (no Content-Length, not chunked — which
+    // linkFetch's keepAlive:false makes ordinary, since every request carries
+    // `Connection: close`) reaches this process as a COMPLETE stream: to the protocol, EOF
+    // is the terminator, and a cut body is indistinguishable from a finished one. Relaying
+    // it re-frames the bytes as clean chunked, so the cell's cache guard — which must never
+    // store a possibly-truncated image under `immutable` — would see nothing wrong. This
+    // header carries the evidence across the seam: present iff the ORIGIN's framing was
+    // verifiable. Truncation of a VERIFIABLE body still shows up mechanically (a cut
+    // chunked stream, a Content-Length mismatch), so presence is all the cell needs.
+    const chunkedOrigin = String(upstream.headers['transfer-encoding'] ?? '')
+      .toLowerCase()
+      .includes('chunked');
+    if (chunkedOrigin || Number.isFinite(declared)) {
+      head['x-lurker-origin-framed'] = '1';
+    }
     // Range plumbing. ⚠ Only claimed when the origin actually demonstrated it: advertising
     // `Accept-Ranges: bytes` for a source that ignores Range makes a media element seek by
     // requesting a range and then silently receive the whole file from byte zero.
