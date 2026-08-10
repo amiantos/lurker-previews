@@ -1,0 +1,12 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "singleQuote": true,
+  "printWidth": 100,
+  "sortPackageJson": false,
+  "ignorePatterns": [
+    "package-lock.json",
+    "vue_client/package-lock.json",
+    "integrations/autonotes/package-lock.json",
+    "LICENSE"
+  ]
+}
