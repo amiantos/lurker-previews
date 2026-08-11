@@ -59,10 +59,15 @@ docker run -d --name lurker-previews --restart unless-stopped \
   --network lurker-previews-net \
   --read-only --tmpfs /tmp \
   --cap-drop ALL --security-opt no-new-privileges \
-  --memory 512m --pids-limit 64 \
+  --memory 512m --pids-limit 128 \
   -e LURKER_PREVIEWS_SELFTEST_TARGETS=<cell-vpc-ip>:8015 \
   ghcr.io/amiantos/lurker-previews:latest
 ```
+
+⚠ `--pids-limit` counts **threads**, not processes. node's own pool plus one capped ffmpeg
+decode (`-threads 2`, set in poster.ts) fits comfortably in 128; meaningfully lower starves
+thread creation with EAGAIN — and the first symptom is silently posterless cards, because a
+missing poster is a supported state and nothing logs.
 
 | env                                | meaning                                                                                             |
 | ---------------------------------- | --------------------------------------------------------------------------------------------------- |

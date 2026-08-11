@@ -168,6 +168,14 @@ async function decodeFrame(file: string): Promise<Buffer | null> {
       '-nostdin',
       '-loglevel',
       'error',
+      // ⚠⚠ Capped, because ffmpeg's default is one decode thread PER CORE and the container
+      // runs under --pids-limit, which counts THREADS. On a 16-core host an uncapped decode
+      // plus node's own pool overran a 64-pid budget and every thread spawn failed EAGAIN —
+      // which this path reports as "no poster", silently, since a missing poster is a
+      // supported state. Found in local QA as "no posters anywhere" with nothing in any log.
+      // Two threads is plenty: this is ONE frame at card size, not a transcode.
+      '-threads',
+      '2',
       '-ss',
       ss,
       '-i',
