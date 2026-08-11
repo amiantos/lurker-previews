@@ -19,11 +19,13 @@
 // with no poster", which is a complete state. Nothing here may fail a resolve.
 
 import { spawn } from 'node:child_process';
+import { createWriteStream } from 'node:fs';
 import { mkdtemp, open, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
 import { bufferStream, safeRequest } from './services/linkFetch.js';
+import { SlotPool } from './utils/slotPool.js';
 import { contentRangeTotal } from './fetchImage.js';
 
 /** How much of the front to take: enough for a faststart index plus the first keyframe.
@@ -153,17 +155,44 @@ export function ffmpegAvailable(): Promise<boolean> {
 }
 
 /**
+ * A frame with (almost) nothing in it — every channel's deviation near zero.
+ *
+ * ⚠⚠ This is what a hole in the sparse window DECODES TO. ffmpeg seeks by the index, and the
+ * index happily names a sample whose bytes were never fetched; the hole reads as zeros, some
+ * decoders (HEVC, with "Invalid NAL unit size" grumbles) still emit a frame, and that frame is
+ * a flat gray card — 2 KB of JPEG that passes every "did we get output" test. Found in local
+ * QA as a blank gray poster on a 46 MB phone clip. A flat frame is only ever a LAST resort,
+ * because it is also — rarely — what a genuinely black clip opens with.
+ */
+export async function looksFlat(jpeg: Buffer): Promise<boolean> {
+  try {
+    const stats = await sharp(jpeg).stats();
+    return stats.channels.every((c) => c.stdev < 2);
+  } catch {
+    // Unreadable by sharp: not this heuristic's call. The cell's signature check is the
+    // gate that decides whether bytes get stored at all.
+    return false;
+  }
+}
+
+/**
  * Decode one frame to JPEG.
  *
  * ⚠ `-ss` BEFORE `-i` so the seek is done by demuxing rather than by decoding every frame up to
  * the mark — on a long file the difference is seconds against milliseconds.
  *
- * ⚠ A small non-zero seek, not 0. Some encoders have no decodable frame exactly at zero, and a
- * seek to 0 is frequently a no-op that yields nothing. ⚠ But it FALLS BACK to 0: a clip shorter
- * than the offset would otherwise answer "no frame" for a video that plainly has one.
+ * ⚠ The seek ORDER depends on how much of the file we hold. For a whole file, 0.5 s first: some
+ * encoders have no decodable frame exactly at zero, and a seek to 0 is frequently a no-op. For a
+ * WINDOWED file — head and maybe tail, hole in between — frame 0 is the only sample whose bytes
+ * are guaranteed inside the head, so it goes first; 0.5 s may be past the window entirely on a
+ * high-bitrate clip, which is precisely the flat-gray case `looksFlat` exists to catch.
  */
-async function decodeFrame(file: string): Promise<Buffer | null> {
-  for (const ss of ['0.5', '0']) {
+async function decodeFrame(
+  file: string,
+  windowed: boolean,
+): Promise<{ jpeg: Buffer; flat: boolean } | null> {
+  let flatFallback: Buffer | null = null;
+  for (const ss of windowed ? ['0', '0.5'] : ['0.5', '0']) {
     const { stdout } = await run('ffmpeg', [
       '-nostdin',
       '-loglevel',
@@ -194,9 +223,76 @@ async function decodeFrame(file: string): Promise<Buffer | null> {
     // ⚠ Judged on OUTPUT, not on the exit code. ffmpeg exits non-zero on a truncated input while
     // still having written a perfectly good frame — which is the normal case here, since the
     // file it was handed is deliberately incomplete.
-    if (stdout.length > 0) return stdout;
+    if (stdout.length === 0) continue;
+    if (!(await looksFlat(stdout))) return { jpeg: stdout, flat: false };
+    flatFallback ??= stdout;
   }
-  return null;
+  // Every seek that produced anything produced a flat card. The CALLER decides what that
+  // means: for a whole file it IS the video's opening; for a windowed one it is more likely
+  // the hole, and grounds to go get the real bytes.
+  return flatFallback ? { jpeg: flatFallback, flat: true } : null;
+}
+
+/** Ceiling on a WHOLE-file fallback fetch. Matches the relay cap video had before the media
+ *  policy retired it — the last size anyone blessed for moving one clip's bytes once. */
+const FULL_FETCH_MAX_BYTES = Number(
+  process.env.LURKER_PREVIEWS_POSTER_FULL_FETCH_BYTES ?? 64 * 1024 * 1024,
+);
+/**
+ * Whole-file fetches in flight. ⚠ /tmp is tmpfs in the shipped container, so a "file" here is
+ * RAM — twenty concurrent 46 MB pulls is the memory limit exceeded, not a busy disk. Two at a
+ * time; a resolve that can't get a slot just keeps the window verdict it already has.
+ */
+const fullFetchPool = new SlotPool({ size: 2, maxQueued: 8, waitMs: 2_000 });
+
+/**
+ * Fetch the ENTIRE file to disk, through the guard, byte-capped and deadline-bounded.
+ *
+ * ⚠ This exists because the window trick has an honest failure mode (a 4K HEVC clip's 0.5 s
+ * is ~1.5 MB of interleaved stream — past any sane head window), and the fix for "we didn't
+ * hold the right bytes" is holding all of them, NOT letting ffmpeg fetch: ffmpeg's own HTTP
+ * client would bypass the DNS-pinned guard entirely, and on a host with no egress firewall
+ * that guard is the only one there is. Cost is bounded and rare: once per URL per cell TTL,
+ * only when the cheap path came up flat, never for files past the cap.
+ */
+async function fetchWhole(
+  url: URL,
+  dir: string,
+  total: number,
+  signal: AbortSignal,
+): Promise<string | null> {
+  if (!Number.isFinite(total) || total > FULL_FETCH_MAX_BYTES) return null;
+  if (!(await fullFetchPool.acquire())) return null;
+  try {
+    const res = await safeRequest(url, { accept: '*/*', streaming: true, signal });
+    if (res.status !== 200) {
+      res.stream.destroy();
+      return null;
+    }
+    const file = path.join(dir, 'whole.bin');
+    const out = createWriteStream(file);
+    let seen = 0;
+    await new Promise<void>((resolve, reject) => {
+      res.stream.on('data', (chunk: Buffer) => {
+        seen += chunk.length;
+        // Counted on bytes actually seen — the origin already stated a total once, but a
+        // stream that keeps going past it is exactly the origin this cap is about.
+        if (seen > FULL_FETCH_MAX_BYTES) {
+          res.stream.destroy();
+          reject(new Error('over the full-fetch cap'));
+        }
+      });
+      res.stream.on('error', reject);
+      out.on('error', reject);
+      res.stream.pipe(out);
+      out.on('finish', resolve);
+    });
+    return file;
+  } catch {
+    return null;
+  } finally {
+    fullFetchPool.release();
+  }
 }
 
 /**
@@ -276,8 +372,16 @@ export async function posterForUrl(
   const dir = await mkdtemp(path.join(tmpdir(), 'poster-'));
   try {
     const file = await materialize(dir, total, head, tail);
-    const jpeg = await decodeFrame(file);
-    if (!jpeg) return null;
+    const windowed = head.length < total;
+    let frame = await decodeFrame(file, windowed);
+    // The window didn't hold a real frame (or held only the hole's flat gray). Go get the
+    // whole file — through the guard — and let ffmpeg pick its frame with everything there.
+    if (windowed && (!frame || frame.flat)) {
+      const whole = await fetchWhole(url, dir, total, signal);
+      if (whole) frame = (await decodeFrame(whole, false)) ?? frame;
+    }
+    if (!frame) return null;
+    const jpeg = frame.jpeg;
     // Measured so the card can reserve the box before the bytes arrive — same reasoning as
     // image dimensions on the resolve path. This JPEG is OUR OWN encoder's output, not origin
     // bytes, but it still goes through sharp's metadata read only, never a decode-and-render.
