@@ -69,6 +69,9 @@ const fetchPool = new SlotPool({ size: 24, maxQueued: 200, waitMs: 3_000 });
  */
 const MAX_TRANSFER_MS = 5 * 60_000;
 
+/** How many times one image request may ask the origin. See the loop in `fetchImage`. */
+const ORIGIN_ATTEMPTS = 2;
+
 /**
  * Total size of the resource a `Content-Range` describes.
  *
@@ -178,32 +181,54 @@ export async function fetchImage(
   }
 
   try {
-    upstream = await safeRequest(url, {
-      // ⚠ Images only — everything else is refused at `proxyableContentType` below, so asking
-      // for video/audio would only invite a body we are going to destroy at its headers.
-      accept: 'image/*,*/*;q=0.5',
-      // ⚠ Still forwarded. An origin may answer a plain GET with a 206 of its own accord, and
-      // a request that arrives with a Range must be asked about the SAME bytes the client
-      // wants — not silently answered from byte zero.
-      range,
-      // Piped, not buffered: the scrape-tuned deadlines cut a healthy media transfer at 20 s
-      // and read a backpressured reader as a dead origin. See FetchOptions.streaming.
-      streaming: true,
-      // So giving up actually ends the fetch. Without it the release above frees a slot while
-      // the request is still dialling — including an uncancellable lookup — which is the
-      // undercount this pool exists to prevent.
-      signal: controller.signal,
-    });
-    // The caller left, or the stream died, while we were awaiting. Without this the response
-    // never gets its `end()`, so the cell hangs on a half-open response with no error to show.
-    if (released || res.destroyed || upstream.stream.destroyed) {
-      // ⚠ Destroyed HERE, not delegated to `release()`. If the caller left during the fetch,
-      // `release()` has already run and latched — calling it again returns at its own guard
-      // and the stream we have only just been handed stays open, unread, until an idle
-      // timeout the streaming flag has already loosened to 30 s.
+    // ⚠⚠ TWO ATTEMPTS, because the origin that matters most here is a POOL and its
+    // refusals are PER-MEMBER. Measured against `opengraph.githubassets.com`, where every
+    // GitHub link's og:image lives: ten consecutive renders reported
+    // `x-ratelimit-remaining` of 73, 19, 72, 33, 45, 0, 78, 0, 58, 32 — each request lands
+    // on a different backend carrying its own budget, so a 429 is a fact about ONE member
+    // and says nothing whatever about the next request. Two of those ten refused while the
+    // other eight served perfectly.
+    //
+    // Believing the first refusal is what turned an occasional failure into an outage: it
+    // armed a HOST-WIDE hold, and every GitHub image on the instance went blank behind it
+    // for as long as the ten-minute ceiling (lurker#776).
+    //
+    // ⚠ ONE retry, not a policy of them. A SECOND refusal is evidence about the host
+    // rather than about one backend, and that is exactly when `noteRefusal` has earned
+    // being believed — more attempts would spend the very budget the hold exists to protect.
+    for (let attempt = 1; ; attempt++) {
+      upstream = await safeRequest(url, {
+        // ⚠ Images only — everything else is refused at `proxyableContentType` below, so asking
+        // for video/audio would only invite a body we are going to destroy at its headers.
+        accept: 'image/*,*/*;q=0.5',
+        // ⚠ Still forwarded. An origin may answer a plain GET with a 206 of its own accord, and
+        // a request that arrives with a Range must be asked about the SAME bytes the client
+        // wants — not silently answered from byte zero.
+        range,
+        // Piped, not buffered: the scrape-tuned deadlines cut a healthy media transfer at 20 s
+        // and read a backpressured reader as a dead origin. See FetchOptions.streaming.
+        streaming: true,
+        // So giving up actually ends the fetch. Without it the release above frees a slot while
+        // the request is still dialling — including an uncancellable lookup — which is the
+        // undercount this pool exists to prevent.
+        signal: controller.signal,
+      });
+      // The caller left, or the stream died, while we were awaiting. Without this the response
+      // never gets its `end()`, so the cell hangs on a half-open response with no error to show.
+      if (released || res.destroyed || upstream.stream.destroyed) {
+        // ⚠ Destroyed HERE, not delegated to `release()`. If the caller left during the fetch,
+        // `release()` has already run and latched — calling it again returns at its own guard
+        // and the stream we have only just been handed stays open, unread, until an idle
+        // timeout the streaming flag has already loosened to 30 s.
+        upstream.stream.destroy();
+        release();
+        return;
+      }
+      if (attempt >= ORIGIN_ATTEMPTS || !isTransientStatus(upstream.status)) break;
+      // ⚠ The body is destroyed before re-asking. A refusal still carries one — GitHub's is
+      // 42 bytes of `text/html` — and leaving it unread holds a socket open for the whole of
+      // the second attempt.
       upstream.stream.destroy();
-      release();
-      return;
     }
 
     // 206 is a success here: it's what a range request is asking for. 416 is the origin
@@ -276,6 +301,22 @@ export async function fetchImage(
       .includes('chunked');
     if (chunkedOrigin || Number.isFinite(declared)) {
       head['x-lurker-origin-framed'] = '1';
+    }
+    // ⚠⚠ FORWARDED so the cell can honour it, because a 200 with real image bytes is not the
+    // same as permission to KEEP them. Every guard on this path tests what the bytes ARE —
+    // type, signature, length, framing — and an origin can satisfy all of them while saying
+    // plainly that the result is not worth holding.
+    //
+    // ⚠ The case that prompted it is not one the pipeline can currently reach, which is worth
+    // stating so it is not read as a bug report. GitHub's og:image service answers a card it
+    // cannot render with a 200 and a valid PNG — the dark Octocat placeholder — under
+    // `max-age=0`, where a real card is `max-age=21600, immutable`; the bytes are
+    // indistinguishable and the header is the only tell. But the repo behind such a
+    // placeholder 404s from github.com, so the resolver calls it dead and no image URL is ever
+    // minted, and an exhausted render budget answers 429 rather than a placeholder. Carried
+    // because the rule is general and costs one header, not because it was observed.
+    if (upstream.headers['cache-control']) {
+      head['cache-control'] = String(upstream.headers['cache-control']);
     }
     // Range plumbing. ⚠ Only claimed when the origin actually demonstrated it: advertising
     // `Accept-Ranges: bytes` for a source that ignores Range makes a media element seek by
