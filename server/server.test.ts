@@ -201,11 +201,54 @@ describe('POST /fetch', () => {
     expect(first.status).toBe(503);
     expect(Number(first.headers.get('retry-after'))).toBeGreaterThan(0);
 
+    // ⚠ TWO asks for ONE request: an attempt and a retry. A 429 from a pooled origin is
+    // one backend's answer, so the hold is armed only once a SECOND backend agrees —
+    // see ORIGIN_ATTEMPTS in fetchImage.ts.
+    const asksAfterFirst = asks;
+    expect(asksAfterFirst).toBe(2);
+
     // ⚠ The cooldown's whole point: the second ask never leaves this process, so the origin's
     // budget can recover. Measured on GitHub's og:image host, which is where this rule came from.
     const second = await post('/fetch', { url: `${originBase}/other.png` });
     expect(second.status).toBe(503);
-    expect(asks).toBe(1);
+    expect(asks).toBe(asksAfterFirst);
+  });
+
+  it('retries a pooled origin once, and serves the attempt that lands', async () => {
+    // ⚠⚠ THE FIX FOR lurker#776's amplifier. `opengraph.githubassets.com` spreads renders
+    // over backends with independent budgets: ten consecutive renders reported
+    // `x-ratelimit-remaining` of 73, 19, 72, 33, 45, 0, 78, 0, 58, 32 — two refused, eight
+    // served. Believing the first refusal armed a host-wide hold and blanked every GitHub
+    // image on the instance behind it.
+    const png = await sharp({
+      create: { width: 8, height: 8, channels: 3, background: '#654321' },
+    })
+      .png()
+      .toBuffer();
+    let asks = 0;
+    handler = (_req, res) => {
+      asks++;
+      if (asks === 1) {
+        // GitHub's actual refusal, down to the body and the fifteen-minute Retry-After
+        // that used to clamp to the ten-minute ceiling.
+        res.writeHead(429, { 'retry-after': '900', 'content-type': 'text/html; charset=utf-8' });
+        res.end('Too many requests, please try again later.');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'image/png', 'content-length': String(png.length) });
+      res.end(png);
+    };
+
+    const res = await post('/fetch', { url: `${originBase}/pooled.png` });
+    expect(res.status).toBe(200);
+    expect(Buffer.from(await res.arrayBuffer()).equals(png)).toBe(true);
+    expect(asks).toBe(2);
+
+    // ⚠ And NO hold was armed. A refusal the retry recovered from must not go on to blank
+    // every other image on the host — that is the whole difference between an occasional
+    // failure and an outage.
+    const { cooldownRemaining } = await import('./utils/originCooldown.js');
+    expect(cooldownRemaining(new URL(originBase).hostname)).toBe(0);
   });
 
   it('answers 403 for a URL the guard refuses', async () => {
