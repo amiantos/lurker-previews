@@ -302,15 +302,19 @@ export async function fetchImage(
     if (chunkedOrigin || Number.isFinite(declared)) {
       head['x-lurker-origin-framed'] = '1';
     }
-    // ⚠⚠ FORWARDED so the cell can honour it, because a 200 with real image bytes is not
-    // the same as permission to KEEP them. GitHub's og:image service answers a card it
-    // cannot render with a 200 and a perfectly valid PNG — the dark Octocat placeholder —
-    // and marks it `cache-control: public, max-age=0`. A card it did render comes back
-    // `public, max-age=21600, immutable`. Nothing on either side of this seam looked at the
-    // header, so the placeholder passed every guard we have (real PNG signature, honest
-    // Content-Length, cleanly framed) and was stored under our own `immutable` for the full
-    // seven days — served long after GitHub started rendering the real thing. The origin
-    // told us not to keep it and we were not listening.
+    // ⚠⚠ FORWARDED so the cell can honour it, because a 200 with real image bytes is not the
+    // same as permission to KEEP them. Every guard on this path tests what the bytes ARE —
+    // type, signature, length, framing — and an origin can satisfy all of them while saying
+    // plainly that the result is not worth holding.
+    //
+    // ⚠ The case that prompted it is not one the pipeline can currently reach, which is worth
+    // stating so it is not read as a bug report. GitHub's og:image service answers a card it
+    // cannot render with a 200 and a valid PNG — the dark Octocat placeholder — under
+    // `max-age=0`, where a real card is `max-age=21600, immutable`; the bytes are
+    // indistinguishable and the header is the only tell. But the repo behind such a
+    // placeholder 404s from github.com, so the resolver calls it dead and no image URL is ever
+    // minted, and an exhausted render budget answers 429 rather than a placeholder. Carried
+    // because the rule is general and costs one header, not because it was observed.
     if (upstream.headers['cache-control']) {
       head['cache-control'] = String(upstream.headers['cache-control']);
     }
