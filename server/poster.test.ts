@@ -247,8 +247,13 @@ describe.skipIf(!ffmpegHere)('HDR posters', () => {
       'gradients=s=320x180:c0=black:c1=white:x0=0:y0=0:x1=320:y1=0:d=1:r=10',
       '-frames:v',
       '10',
+      // ⚠ 8-bit, though real HDR is 10. These fixtures are only ever read for their
+      // color_transfer TAG, and forcing 10-bit with no explicit codec asks the default
+      // Matroska encoder for high10 — which a smaller ffmpeg build can lack while decoding
+      // HDR at runtime perfectly well, failing the suite for a reason it does not test.
+      // (Copilot.)
       '-pix_fmt',
-      'yuv420p10le',
+      'yuv420p',
       '-color_trc',
       transfer,
       '-color_primaries',
@@ -317,6 +322,37 @@ describe.skipIf(!ffmpegHere)('HDR posters', () => {
       expect(poster!.width).toBeGreaterThan(0);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+describe.skipIf(!ffmpegHere)('the tone-map fallback', () => {
+  it('falls back to the plain chain when the tone-mapped one will not run', async () => {
+    // ⚠⚠ The branch that exists for builds without libzimg, which is not a build this suite
+    // can obtain — so the unrunnable chain is supplied directly instead. A filter ffmpeg
+    // refuses stands in for a filter it does not have: both make the command exit without
+    // writing a frame, which is the only property the fallback keys on.
+    const { decodeWithFallbackForTests } = await import('./poster.js');
+    const dir = await mkdtemp(path.join(tmpdir(), 'poster-fb-'));
+    try {
+      const file = path.join(dir, 'clip.mp4');
+      makeVideo(file, true);
+
+      // Sanity first: the plain chain really does decode this file, so a null below is the
+      // fallback failing rather than the fixture being undecodable.
+      expect(
+        await decodeWithFallbackForTests(file, false, `scale='min(640,iw)':-2`),
+      ).not.toBeNull();
+
+      const frame = await decodeWithFallbackForTests(
+        file,
+        false,
+        `definitely_not_a_filter=1,scale='min(640,iw)':-2`,
+      );
+      expect(frame).not.toBeNull();
+      expect(frame!.jpeg.length).toBeGreaterThan(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
     }
   });
 });

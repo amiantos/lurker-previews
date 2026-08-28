@@ -323,6 +323,34 @@ export async function posterFilter(file: string): Promise<string> {
   return (await needsToneMap(file)) ? `${TONEMAP_VF},${SCALE_VF}` : SCALE_VF;
 }
 
+/**
+ * One decode, tone-mapped when the source needs it and plain when that chain will not run.
+ *
+ * ⚠⚠ A build without libzimg fails the WHOLE command rather than skipping the filter it
+ * cannot run, which would turn "the poster is too bright" into "there is no poster" — a
+ * strictly worse outcome, and a silent one, since a missing poster is a supported state.
+ * Debian's ffmpeg (the decoder image) has zscale; a self-hoster's may not.
+ *
+ * ⚠⚠ ONE function rather than the retry written out beside each decode, because written out
+ * it covered only the FIRST of the two: the whole-file fallback asked with the tone-mapped
+ * chain alone, so on such a build it failed and the caller kept the sparse window's FLAT
+ * frame — precisely the frame the whole-file fetch exists to replace. A guard sitting at one
+ * of two call sites reads as covering both. (Copilot.)
+ */
+async function decodeWithFallback(
+  file: string,
+  windowed: boolean,
+  vf: string,
+): Promise<{ jpeg: Buffer; flat: boolean } | null> {
+  const frame = await decodeFrame(file, windowed, vf);
+  if (frame || vf === SCALE_VF) return frame;
+  return decodeFrame(file, windowed, SCALE_VF);
+}
+
+/** Test seam: the fallback is only reachable with a chain ffmpeg refuses, which the image
+ *  this ships in never produces. Exported so an unrunnable chain can be handed to it. */
+export const decodeWithFallbackForTests = decodeWithFallback;
+
 /** Ceiling on a WHOLE-file fallback fetch. Matches the relay cap video had before the media
  *  policy retired it — the last size anyone blessed for moving one clip's bytes once. */
 const FULL_FETCH_MAX_BYTES = Number(
@@ -464,19 +492,18 @@ export async function posterForUrl(
     const file = await materialize(dir, total, head, tail);
     const windowed = head.length < total;
     // ⚠ Probed once per poster, not per seek attempt — `decodeFrame` tries two offsets.
-    const vf = await posterFilter(file);
-    let frame = await decodeFrame(file, windowed, vf);
-    // ⚠⚠ A build without libzimg fails the WHOLE command rather than skipping the filter it
-    // cannot run, which would turn "the poster is too bright" into "there is no poster" —
-    // a strictly worse outcome, and a silent one, since a missing poster is a supported
-    // state. Debian's ffmpeg (the decoder image) has zscale; a self-hoster's may not, so
-    // the plain chain is tried before giving up.
-    if (!frame && vf !== SCALE_VF) frame = await decodeFrame(file, windowed, SCALE_VF);
+    let frame = await decodeWithFallback(file, windowed, await posterFilter(file));
     // The window didn't hold a real frame (or held only the hole's flat gray). Go get the
     // whole file — through the guard — and let ffmpeg pick its frame with everything there.
     if (windowed && (!frame || frame.flat)) {
       const whole = await fetchWhole(url, dir, total, signal);
-      if (whole) frame = (await decodeFrame(whole, false, vf)) ?? frame;
+      // ⚠ RE-PROBED against the whole file rather than reusing the window's answer. The
+      // sparse file can have its stream header inside the hole, and `needsToneMap` fails to
+      // `false` when it cannot read one — so a genuinely HDR clip whose header did not make
+      // the head fetch would carry that "SDR" verdict into the one decode that has all the
+      // bytes. One ffprobe, on a path that has just pulled the entire file over the network.
+      if (whole)
+        frame = (await decodeWithFallback(whole, false, await posterFilter(whole))) ?? frame;
     }
     if (!frame) return null;
     const jpeg = frame.jpeg;
