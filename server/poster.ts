@@ -187,9 +187,84 @@ export async function looksFlat(jpeg: Buffer): Promise<boolean> {
  * are guaranteed inside the head, so it goes first; 0.5 s may be past the window entirely on a
  * high-bitrate clip, which is precisely the flat-gray case `looksFlat` exists to catch.
  */
+/** Longest edge clamped, aspect preserved, never upscaled. The tail of every chain. */
+const SCALE_VF = `scale='min(${POSTER_MAX_EDGE},iw)':-2`;
+
+/**
+ * The HDR→SDR tone map, in front of the scale.
+ *
+ * ⚠⚠ WITHOUT THIS AN HDR FRAME IS DECODED AS THOUGH IT WERE bt709, which is simply the
+ * wrong curve: PQ (`smpte2084`) and HLG (`arib-std-b67`) both encode luminance quite
+ * differently from a gamma-2.2 ramp, and reading one as the other lands the whole picture
+ * at the wrong brightness. lurker-previews#1, reported as "HDR video posters are too
+ * bright" — which is the HLG direction, and the one phone cameras record in.
+ *
+ * ⚠⚠ `hable`, CHOSEN ON REAL FOOTAGE, and the first answer here was wrong. A synthetic
+ * fixture — an SDR ramp pushed through PQ at a 1000-nit peak and back — ranked `mobius`
+ * nearest the source (YAVG 165.9 against 177.9, where `hable` gave 118.1), and that ranking
+ * does not survive contact with camera HDR. On an actual HLG clip (HEVC 4K 10-bit, bt2020,
+ * `arib-std-b67`) the operator's verdict was that `hable` alone looks like the footage and
+ * `mobius` and `reinhard` are both visibly off — they LIFT the picture, which is the very
+ * complaint this fixes:
+ *
+ *     no tone map  YAVG 127.0     hable  123.4     reinhard  148.6     mobius  155.1
+ *
+ * The synthetic ramp misleads because its values sit low on the transfer curve and never
+ * exercise the highlight roll-off that dominates a real frame; `mobius`'s "leave SDR-safe
+ * values alone" is close to a no-op there and a brightening almost everywhere else. Trust
+ * the clip, not the ramp — and note that "closest YAVG to the untone-mapped frame" is not
+ * the target either, it is just where the right answer happened to land here.
+ *
+ * ⚠⚠ npl=75 UNDERSTATES the source on purpose, and that is the whole of the brightness
+ * trim. `npl` is the nominal peak luminance zscale assumes when it takes HLG to linear
+ * light, so a lower figure means less of the signal reads as "above SDR" and `hable`
+ * compresses less — the frame comes out brighter without touching its black point or its
+ * highlight roll-off. At a truthful npl=100 the operator's read on real footage was "a hair
+ * dark"; 75 was picked by eye against the same clip (YAVG 123.4 → 132.8).
+ *
+ * ⚠ Preferred over a `gamma` lift bolted on after the curve, which was the other candidate
+ * and measured almost the same (130.1). A trim inside the colour pipeline stays a colour
+ * decision — it keeps the roll-off headroom the tone map is there to manage — where a gamma
+ * tweak on the finished frame also raises the shadows of every clip that passes through.
+ *
+ */
+const TONEMAP_VF =
+  'zscale=t=linear:npl=75,format=gbrpf32le,zscale=p=bt709,' +
+  'tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p';
+
+/** Transfer characteristics that mean "not SDR", per ffprobe's spelling. */
+const HDR_TRANSFERS = new Set(['smpte2084', 'arib-std-b67']);
+
+/**
+ * Does this file need tone mapping?
+ *
+ * ⚠ Answered from the stream's own tag rather than guessed from the pixels, and it decides
+ * only whether to ADD a filter — an SDR file must reach ffmpeg exactly as it does today,
+ * since running a tone map over bt709 content would alter a picture that is already right.
+ *
+ * ⚠ Fails to `false`, which is the current behaviour: a probe that cannot answer (no
+ * ffprobe, a container header still inside the sparse window's hole, a codec it cannot
+ * parse) must not cost us a poster we would otherwise have produced.
+ */
+async function needsToneMap(file: string): Promise<boolean> {
+  const { stdout } = await run('ffprobe', [
+    '-v',
+    'error',
+    '-select_streams',
+    'v:0',
+    '-show_entries',
+    'stream=color_transfer',
+    '-of',
+    'default=nw=1:nk=1',
+    file,
+  ]);
+  return HDR_TRANSFERS.has(stdout.toString('utf8').trim());
+}
+
 async function decodeFrame(
   file: string,
   windowed: boolean,
+  vf: string = SCALE_VF,
 ): Promise<{ jpeg: Buffer; flat: boolean } | null> {
   let flatFallback: Buffer | null = null;
   for (const ss of windowed ? ['0', '0.5'] : ['0.5', '0']) {
@@ -211,9 +286,8 @@ async function decodeFrame(
       file,
       '-frames:v',
       '1',
-      // Longest edge clamped, aspect preserved, and never upscaled.
       '-vf',
-      `scale='min(${POSTER_MAX_EDGE},iw)':-2`,
+      vf,
       '-q:v',
       '4',
       '-f',
@@ -231,6 +305,22 @@ async function decodeFrame(
   // means: for a whole file it IS the video's opening; for a windowed one it is more likely
   // the hole, and grounds to go get the real bytes.
   return flatFallback ? { jpeg: flatFallback, flat: true } : null;
+}
+
+/**
+ * The `-vf` chain for one file: tone-mapped when the stream says it is HDR, plain otherwise.
+ *
+ * ⚠ Exported for the test, and it is the right seam to expose rather than `needsToneMap`.
+ * What can break here is the WIRING as much as the probe — a chain built and then not
+ * passed to ffmpeg looks identical from the outside — and a perceptual assertion is not
+ * available to test either half: synthetic fixtures do not behave like camera HDR (an SDR
+ * ramp merely tagged HLG tone-maps to within 0.13 of itself), so a brightness comparison
+ * either measures swscale's matrix conversion instead or measures nothing at all. Both were
+ * tried. This asserts the decision and the wiring, which are the parts that can regress
+ * silently; the picture itself wants a real clip and a pair of eyes.
+ */
+export async function posterFilter(file: string): Promise<string> {
+  return (await needsToneMap(file)) ? `${TONEMAP_VF},${SCALE_VF}` : SCALE_VF;
 }
 
 /** Ceiling on a WHOLE-file fallback fetch. Matches the relay cap video had before the media
@@ -373,12 +463,20 @@ export async function posterForUrl(
   try {
     const file = await materialize(dir, total, head, tail);
     const windowed = head.length < total;
-    let frame = await decodeFrame(file, windowed);
+    // ⚠ Probed once per poster, not per seek attempt — `decodeFrame` tries two offsets.
+    const vf = await posterFilter(file);
+    let frame = await decodeFrame(file, windowed, vf);
+    // ⚠⚠ A build without libzimg fails the WHOLE command rather than skipping the filter it
+    // cannot run, which would turn "the poster is too bright" into "there is no poster" —
+    // a strictly worse outcome, and a silent one, since a missing poster is a supported
+    // state. Debian's ffmpeg (the decoder image) has zscale; a self-hoster's may not, so
+    // the plain chain is tried before giving up.
+    if (!frame && vf !== SCALE_VF) frame = await decodeFrame(file, windowed, SCALE_VF);
     // The window didn't hold a real frame (or held only the hole's flat gray). Go get the
     // whole file — through the guard — and let ffmpeg pick its frame with everything there.
     if (windowed && (!frame || frame.flat)) {
       const whole = await fetchWhole(url, dir, total, signal);
-      if (whole) frame = (await decodeFrame(whole, false)) ?? frame;
+      if (whole) frame = (await decodeFrame(whole, false, vf)) ?? frame;
     }
     if (!frame) return null;
     const jpeg = frame.jpeg;
