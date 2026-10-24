@@ -40,6 +40,11 @@ const MAX_INPUT_PIXELS = 25_000_000;
  */
 const MAX_ANIMATED_PIXELS = 20_000_000;
 
+/** An animation of more frames than this is its first frame: per-frame codec work isn't
+ *  bounded by pixel area, and 150,000 1×1 frames took 48 s to encode (Codex). A long
+ *  avatar loop is a few hundred. */
+const MAX_ANIMATED_FRAMES = 500;
+
 /** A resized animation larger than this is sent as its first frame instead. Generous for a
  *  256 px loop; a still avatar is tens of KB. */
 const MAX_ANIMATED_BYTES = 512 * 1024;
@@ -78,12 +83,14 @@ class Refused extends Error {
 export interface AvatarLimits {
   maxInputPixels: number;
   maxAnimatedPixels: number;
+  maxAnimatedFrames: number;
   maxAnimatedBytes: number;
 }
 
 const LIMITS: AvatarLimits = {
   maxInputPixels: MAX_INPUT_PIXELS,
   maxAnimatedPixels: MAX_ANIMATED_PIXELS,
+  maxAnimatedFrames: MAX_ANIMATED_FRAMES,
   maxAnimatedBytes: MAX_ANIMATED_BYTES,
 };
 
@@ -92,7 +99,7 @@ const LIMITS: AvatarLimits = {
  * Exported for its tests, which pass small `limits` rather than build 50 MP images.
  */
 export async function makeAvatar(input: Buffer, limits: AvatarLimits = LIMITS): Promise<Avatar> {
-  const { maxInputPixels, maxAnimatedPixels, maxAnimatedBytes } = limits;
+  const { maxInputPixels, maxAnimatedPixels, maxAnimatedFrames, maxAnimatedBytes } = limits;
   let meta: Metadata;
   try {
     meta = await sharp(input, { limitInputPixels: maxInputPixels }).metadata();
@@ -109,7 +116,7 @@ export async function makeAvatar(input: Buffer, limits: AvatarLimits = LIMITS): 
   const side = Math.max(1, Math.min(AVATAR_SIZE, width, height));
 
   // Checked here to skip a decode that would only fail: limitInputPixels below bounds it too.
-  if (pages > 1 && width * height * pages <= maxAnimatedPixels) {
+  if (pages > 1 && pages <= maxAnimatedFrames && width * height * pages <= maxAnimatedPixels) {
     try {
       const out = await sharp(input, { animated: true, limitInputPixels: maxAnimatedPixels })
         .resize(side, side, { fit: 'cover', position: 'centre' })
@@ -189,6 +196,12 @@ export async function handleAvatar(res: ServerResponse, rawUrl: string): Promise
   }
   if (!(await avatarPool.acquire())) {
     res.writeHead(503, { 'retry-after': '5' }).end();
+    return;
+  }
+  // The cell left while this waited for a slot: its `close` has already fired, so nothing
+  // below would ever stop the fetch. Start nothing.
+  if (res.destroyed) {
+    avatarPool.release();
     return;
   }
   const controller = new AbortController();

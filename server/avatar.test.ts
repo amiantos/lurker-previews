@@ -37,7 +37,12 @@ async function animatedGif(width: number, height: number, pages = 3): Promise<Bu
     .toBuffer();
 }
 
-const big = { maxInputPixels: 25_000_000, maxAnimatedPixels: 20_000_000, maxAnimatedBytes: 1e6 };
+const big = {
+  maxInputPixels: 25_000_000,
+  maxAnimatedPixels: 20_000_000,
+  maxAnimatedFrames: 500,
+  maxAnimatedBytes: 1e6,
+};
 
 describe('makeAvatar', () => {
   it('crops a still to a 256 square WebP', async () => {
@@ -63,6 +68,11 @@ describe('makeAvatar', () => {
     const out = await makeAvatar(gif, { ...big, maxAnimatedPixels: 6399 });
     const meta = await sharp(out.webp, { animated: true }).metadata();
     expect([meta.pages ?? 1, meta.width, out.animated]).toEqual([1, 40, false]);
+  });
+
+  it('sends the first frame of an animation with too many frames, however small', async () => {
+    const out = await makeAvatar(await animatedGif(8, 8, 4), { ...big, maxAnimatedFrames: 3 });
+    expect(out.animated).toBe(false);
   });
 
   it('sends the first frame of an animation that resizes past the byte budget', async () => {
