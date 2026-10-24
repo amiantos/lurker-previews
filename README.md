@@ -22,7 +22,18 @@ POST /resolve          { "url": "…" }
 POST /fetch            { "url": "…", "range": "bytes=…"? }
   → 200/206  image bytes, streamed, with the origin's Content-Type/Length/Range headers
   → 403/404/413/416/502/503 per the same contract
+POST /avatar           { "url": "…" }
+  → 200  the image as a square WebP, at most 256 px a side, never enlarged; animated GIF and
+         WebP stay animated (x-lurker-avatar-animated: 1) unless they have over 500 frames,
+         decode past 20 MP or the result passes 512 KB, when they're their first frame; the
+         origin's Cache-Control is forwarded
+  → 403 refused · 413 over 8 MB · 415 not an image we take, or a still past 25 MP
+  → 502 the origin gave nothing usable · 503 + Retry-After
 ```
+
+⚠ **`/avatar` never answers 404.** The cell reads a 404 there as "this decoder predates the
+endpoint" and relays through `/fetch` instead, so a cell updated before its decoder still
+shows avatars.
 
 ⚠ **502 and 503 are different answers and must stay different.** The cell caches a 502 as a
 dead link for an hour; a 503 gets a fifteen-second TTL and a retry. An origin's busy minute

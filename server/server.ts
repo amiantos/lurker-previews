@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Brad Root
 // SPDX-License-Identifier: MPL-2.0
 
-// The HTTP surface. Three endpoints, `node:http`, no framework — this service's
+// The HTTP surface. Four endpoints, `node:http`, no framework — this service's
 // entire justification is a small attack surface, and a router dependency is
 // surface. The caller is the cell, over a private bridge; there is no auth
 // because there are no credentials here to protect and nothing reaches this
@@ -11,6 +11,7 @@
 //   GET  /health          200 once the self-test passed; 503 otherwise
 //   POST /resolve         { url }          → verdict, per the contract
 //   POST /fetch           { url, range? }  → image bytes, streamed
+//   POST /avatar          { url }          → the image as a ≤256 px square WebP (avatar.ts)
 //
 // Status mapping is the contract's whole value — see resolve.ts's header and
 // lurker-dev/LINK_PREVIEWS_ISOLATION.md. ⚠⚠ 503 ALWAYS carries Retry-After, and
@@ -20,6 +21,7 @@ import http from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { resolveUrl } from './resolve.js';
 import { fetchImage } from './fetchImage.js';
+import { handleAvatar } from './avatar.js';
 import { SlotPool } from './utils/slotPool.js';
 import { withDeadline, DeadlineExceeded } from './utils/withDeadline.js';
 
@@ -180,7 +182,10 @@ export function createHandler(state: ServerState) {
         res.end(state.reason);
         return;
       }
-      if (req.method !== 'POST' || (req.url !== '/resolve' && req.url !== '/fetch')) {
+      if (
+        req.method !== 'POST' ||
+        (req.url !== '/resolve' && req.url !== '/fetch' && req.url !== '/avatar')
+      ) {
         res.writeHead(404).end();
         return;
       }
@@ -204,6 +209,10 @@ export function createHandler(state: ServerState) {
 
       if (req.url === '/resolve') {
         await handleResolve(res, parsed.url, parsed.wantPoster === true);
+        return;
+      }
+      if (req.url === '/avatar') {
+        await handleAvatar(res, parsed.url);
         return;
       }
       // /fetch. The range is passed through untrusted — linkFetch's RANGE_RE refuses a
