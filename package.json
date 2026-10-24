@@ -1,6 +1,6 @@
 {
   "name": "lurker-previews",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lurker's link-preview decoder: fetches, scrapes, measures and decodes hostile bytes so the cell never has to",
   "license": "MPL-2.0",
   "type": "module",
