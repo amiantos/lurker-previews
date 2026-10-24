@@ -37,7 +37,7 @@ async function animatedGif(width: number, height: number, pages = 3): Promise<Bu
     .toBuffer();
 }
 
-const big = { maxInputPixels: 50_000_000, maxAnimatedPixels: 20_000_000, maxAnimatedBytes: 1e6 };
+const big = { maxInputPixels: 25_000_000, maxAnimatedPixels: 20_000_000, maxAnimatedBytes: 1e6 };
 
 describe('makeAvatar', () => {
   it('crops a still to a 256 square WebP', async () => {
@@ -122,6 +122,15 @@ describe('POST /avatar', () => {
     expect(res.headers.get('x-lurker-avatar-animated')).toBe('1');
     const meta = await sharp(Buffer.from(await res.arrayBuffer()), { animated: true }).metadata();
     expect([meta.pages, meta.width]).toEqual([3, 200]);
+  });
+
+  it("forwards the origin's Cache-Control, for the cell's store decision", async () => {
+    const jpeg = await still(64, 64);
+    handler = (_req, res) =>
+      res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' }).end(jpeg);
+    const res = await ask(`${originBase}/private.jpg`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');
   });
 
   it('is a 415 for a body that is not an image', async () => {

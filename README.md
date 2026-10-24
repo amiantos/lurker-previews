@@ -25,8 +25,9 @@ POST /fetch            { "url": "…", "range": "bytes=…"? }
 POST /avatar           { "url": "…" }
   → 200  the image as a square WebP, at most 256 px a side, never enlarged; animated GIF and
          WebP stay animated (x-lurker-avatar-animated: 1) unless their frames decode past
-         20 MP or the result passes 512 KB, when they're their first frame
-  → 403 refused · 413 over 8 MB · 415 not an image we take, or a still past 50 MP
+         20 MP or the result passes 512 KB, when they're their first frame; the
+         origin's Cache-Control is forwarded
+  → 403 refused · 413 over 8 MB · 415 not an image we take, or a still past 25 MP
   → 502 the origin gave nothing usable · 503 + Retry-After
 ```
 

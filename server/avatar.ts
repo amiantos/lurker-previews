@@ -29,8 +29,9 @@ import { withDeadline, DeadlineExceeded } from './utils/withDeadline.js';
 export const AVATAR_SIZE = 256;
 
 /** A still that decodes to more than this is refused: an 8 MB file can describe a
- *  gigapixel canvas, and that decode is the cost this endpoint exists to bound. */
-const MAX_INPUT_PIXELS = 50_000_000;
+ *  gigapixel canvas, and that decode is the cost this endpoint exists to bound. 25 MP is a
+ *  6000×4000 photo, ~100 MB of RGBA, so the pool's decodes stay well inside `--memory 512m`. */
+const MAX_INPUT_PIXELS = 25_000_000;
 
 /**
  * An animation is decoded whole only when ALL its frames together fit this; past it, only its
@@ -46,11 +47,12 @@ const MAX_ANIMATED_BYTES = 512 * 1024;
 const QUALITY = 80;
 
 /**
- * Avatars in flight. Small: each one is a fetch AND a decode, and a decode runs on libuv's
- * pool, which the resolver's DNS lookups share. The cell's own pool and per-user throttle
- * bound what reaches it; this bounds what one cell — or the next caller — can make it do.
+ * Avatars in flight. Two: each one is a fetch AND a decode, and sharp's work runs on libuv's
+ * pool — four threads by default — which every /resolve and /fetch DNS lookup shares. Two
+ * leaves the lookups room. The cell coalesces one avatar's viewers into one ask, and a
+ * typical avatar decodes in milliseconds, so the queue moves.
  */
-const avatarPool = new SlotPool({ size: 8, maxQueued: 100, waitMs: 5_000 });
+const avatarPool = new SlotPool({ size: 2, maxQueued: 100, waitMs: 5_000 });
 
 /** One avatar, start to finish: the origin's hop deadline plus a decode. */
 const AVATAR_DEADLINE_MS = 30_000;
@@ -60,6 +62,8 @@ const ORIGIN_ATTEMPTS = 2;
 export interface Avatar {
   webp: Buffer;
   animated: boolean;
+  /** The origin's, forwarded so the cell's store decision can honour it, as /fetch does. */
+  cacheControl?: string;
 }
 
 class Refused extends Error {
@@ -129,10 +133,19 @@ export async function makeAvatar(input: Buffer, limits: AvatarLimits = LIMITS): 
   }
 }
 
-/** The origin's bytes for `url`, or a Refused carrying the status to answer. */
-async function fetchBytes(url: URL, signal: AbortSignal): Promise<Buffer> {
+/** The origin's bytes for `url` and its Cache-Control, or a Refused with the status to answer. */
+async function fetchBytes(
+  url: URL,
+  signal: AbortSignal,
+): Promise<{ body: Buffer; cacheControl?: string }> {
   for (let attempt = 1; ; attempt++) {
-    const upstream = await safeRequest(url, { accept: 'image/*,*/*;q=0.5', signal });
+    // ⚠ `streaming`: the scrape deadline would cut a slow 8 MB body at 20 s and call it dead.
+    // The whole avatar is bounded by AVATAR_DEADLINE_MS instead, which answers 503.
+    const upstream = await safeRequest(url, {
+      accept: 'image/*,*/*;q=0.5',
+      streaming: true,
+      signal,
+    });
     if (attempt < ORIGIN_ATTEMPTS && isTransientStatus(upstream.status)) {
       upstream.stream.destroy();
       continue;
@@ -155,9 +168,10 @@ async function fetchBytes(url: URL, signal: AbortSignal): Promise<Buffer> {
     // One byte past the cap: a body that reaches it is over.
     const read = await bufferStream(upstream, { maxBytes: MAX_IMAGE_PROXY_BYTES + 1 });
     if (read.body.length > MAX_IMAGE_PROXY_BYTES) throw new Refused(413);
-    // Cut short some other way (the peer went, a deadline): nothing whole to decode.
+    // Cut short some other way (the peer went away): nothing whole to decode.
     if (read.truncated) throw new Refused(502);
-    return read.body;
+    const cacheControl = upstream.headers['cache-control'];
+    return { body: read.body, ...(cacheControl ? { cacheControl: String(cacheControl) } : {}) };
   }
 }
 
@@ -178,13 +192,22 @@ export async function handleAvatar(res: ServerResponse, rawUrl: string): Promise
     return;
   }
   const controller = new AbortController();
-  const work = fetchBytes(url, controller.signal).then(makeAvatar);
+  // The cell gave up or went: stop the fetch, so the slot isn't held for nobody. (A decode
+  // already running finishes; the slot waits for it below.)
+  res.on('close', () => {
+    if (!res.writableFinished) controller.abort();
+  });
+  const work = fetchBytes(url, controller.signal).then(async ({ body, cacheControl }) => ({
+    ...(await makeAvatar(body)),
+    ...(cacheControl ? { cacheControl } : {}),
+  }));
   try {
     const avatar = await withDeadline(work, AVATAR_DEADLINE_MS, 'avatar');
     res.writeHead(200, {
       'content-type': 'image/webp',
       'content-length': String(avatar.webp.length),
       ...(avatar.animated ? { 'x-lurker-avatar-animated': '1' } : {}),
+      ...(avatar.cacheControl ? { 'cache-control': avatar.cacheControl } : {}),
     });
     res.end(avatar.webp);
   } catch (err) {
