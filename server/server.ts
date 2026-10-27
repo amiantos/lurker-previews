@@ -24,6 +24,7 @@ import { fetchImage } from './fetchImage.js';
 import { handleAvatar } from './avatar.js';
 import { SlotPool } from './utils/slotPool.js';
 import { withDeadline, DeadlineExceeded } from './utils/withDeadline.js';
+import { vetText } from './utils/vetText.js';
 
 /**
  * Resolves in flight, mirroring the bound the cell keeps on its side of the seam.
@@ -139,7 +140,8 @@ async function handleResolve(
       case 'refused':
         // The reason is for the CELL's warn line — "misconfigured link or somebody
         // probing" — which stayed exactly as informative as it was in-process.
-        json(res, 403, { reason: out.reason });
+        // ⚠ Vetted: a reason can quote what an origin sent (a content-encoding, say).
+        json(res, 403, { reason: vetText(out.reason) });
         return;
       case 'dead':
         res.writeHead(502).end();
@@ -195,13 +197,21 @@ export function createHandler(state: ServerState) {
         res.writeHead(413).end();
         return;
       }
-      let parsed: { url?: unknown; range?: unknown; wantPoster?: unknown };
+      let decoded: unknown;
       try {
-        parsed = JSON.parse(body.toString('utf8')) as typeof parsed;
+        decoded = JSON.parse(body.toString('utf8'));
       } catch {
         json(res, 400, { error: 'body must be JSON' });
         return;
       }
+      // ⚠ `null`, a number, a string and an array all parse as JSON; `parsed.url` on the first
+      // threw before any validation ran, and the outer catch answered 500 — which the cell
+      // files as transient and retries. A malformed body is a 400, every time.
+      if (typeof decoded !== 'object' || decoded === null || Array.isArray(decoded)) {
+        json(res, 400, { error: 'body must be a JSON object' });
+        return;
+      }
+      const parsed = decoded as { url?: unknown; range?: unknown; wantPoster?: unknown };
       if (typeof parsed.url !== 'string' || !parsed.url) {
         json(res, 400, { error: 'url must be a string' });
         return;

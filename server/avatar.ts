@@ -17,7 +17,8 @@
 // it — so the cap is enforced by reading at most one byte past it.
 
 import type { ServerResponse } from 'node:http';
-import sharp, { type Metadata } from 'sharp';
+import type { Metadata } from 'sharp';
+import sharp from './utils/sharp.js';
 import { bufferStream, normalizeUrl, safeRequest, UnsafeUrlError } from './services/linkFetch.js';
 import { cooldownRemaining, isTransientStatus, noteRefusal } from './utils/originCooldown.js';
 import { MAX_IMAGE_PROXY_BYTES, proxyableContentType } from './fetchImage.js';

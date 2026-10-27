@@ -20,6 +20,13 @@ describe('isBlockedIpv4', () => {
       '172.31.255.255',
       '192.168.1.1',
       '100.64.0.1', // CGNAT
+      '192.0.0.8', // RFC 6890 IETF protocol assignments
+      '192.0.2.1', // TEST-NET-1
+      '192.88.99.1', // 6to4 relay anycast
+      '198.18.0.1', // benchmarking
+      '198.19.255.255',
+      '198.51.100.1', // TEST-NET-2
+      '203.0.113.1', // TEST-NET-3
       '224.0.0.1', // multicast
       '255.255.255.255',
     ]) {
@@ -28,7 +35,18 @@ describe('isBlockedIpv4', () => {
   });
 
   it('allows ordinary public addresses', () => {
-    for (const ip of ['8.8.8.8', '1.1.1.1', '172.15.0.1', '172.32.0.1', '100.63.0.1']) {
+    for (const ip of [
+      '8.8.8.8',
+      '1.1.1.1',
+      '172.15.0.1',
+      '172.32.0.1',
+      '100.63.0.1',
+      '192.0.1.1', // beside the RFC 6890 blocks, not inside them
+      '192.0.3.1',
+      '198.17.255.255',
+      '198.20.0.1',
+      '203.0.114.1',
+    ]) {
       expect(isBlockedIpv4(ip)).toBe(false);
     }
   });
@@ -102,13 +120,22 @@ describe('isBlockedIpLiteral — IPv4-in-IPv6 tunnels', () => {
     expect(isBlockedIpLiteral('2002:a9fe:a9fe::')).toBe(true); // 169.254.169.254
   });
 
+  it('blocks the IPv6 twins of the RFC 6890 blocks: documentation and benchmarking space', () => {
+    expect(isBlockedIpLiteral('2001:db8::1')).toBe(true);
+    expect(isBlockedIpLiteral('2001:db8:ffff::1')).toBe(true);
+    expect(isBlockedIpLiteral('2001:2::1')).toBe(true);
+    expect(isBlockedIpLiteral('2001:2:0:ffff::1')).toBe(true);
+    expect(isBlockedIpLiteral('2001:2:1::1')).toBe(false); // outside the /48
+    expect(isBlockedIpLiteral('2001:db9::1')).toBe(false);
+  });
+
   it('blocks Teredo', () => {
     expect(isBlockedIpLiteral('2001:0:0:0:0:0:a9fe:a9fe')).toBe(true);
     expect(isBlockedIpLiteral('2001:0::1')).toBe(true);
   });
 
   it('does not over-block ordinary public IPv6 that merely starts 2001', () => {
-    expect(isBlockedIpLiteral('2001:db8::1')).toBe(false);
+    expect(isBlockedIpLiteral('2a00:1450:4001::1')).toBe(false);
     expect(isBlockedIpLiteral('2001:4860:4860::8888')).toBe(false);
     expect(isBlockedIpLiteral('2606:4700:4700::1111')).toBe(false);
   });
@@ -151,7 +178,7 @@ describe('isBlockedIpLiteral — IPv4-in-IPv6 tunnels', () => {
 describe('isBlockedIpLiteral — IPv6 is an allowlist', () => {
   it('allows only global unicast (2000::/3)', () => {
     expect(isBlockedIpLiteral('2606:4700:4700::1111')).toBe(false);
-    expect(isBlockedIpLiteral('2001:db8::1')).toBe(false);
+    expect(isBlockedIpLiteral('2a00:1450:4001::1')).toBe(false);
     expect(isBlockedIpLiteral('3fff::1')).toBe(false);
     // Just outside the range on either side.
     expect(isBlockedIpLiteral('1fff::1')).toBe(true);

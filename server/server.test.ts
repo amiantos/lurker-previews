@@ -266,6 +266,15 @@ describe('request plumbing', () => {
     expect((await post('/resolve', { nope: true })).status).toBe(400);
   });
 
+  it('rejects a JSON body that is not an object with 400, never 500', async () => {
+    // ⚠ `null` parses as JSON and `parsed.url` threw before any check ran; the outer catch
+    // answered 500, which the cell files as transient and retries.
+    for (const raw of ['null', '42', '"str"', '[]', 'true']) {
+      const res = await fetch(`${serviceBase}/resolve`, { method: 'POST', body: raw });
+      expect(res.status).toBe(400);
+    }
+  });
+
   it('404s everything that is not the three endpoints', async () => {
     expect((await fetch(`${serviceBase}/anything`)).status).toBe(404);
     expect((await fetch(`${serviceBase}/resolve`)).status).toBe(404); // GET, not POST

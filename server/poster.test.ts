@@ -12,7 +12,9 @@
 // silently turn the tail test into a second copy of the head one.
 
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { readdirSync } from 'node:fs';
+import { availableParallelism } from 'node:os';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -24,7 +26,8 @@ vi.mock('./utils/ipGuard.js', () => ({
   isBlockedIpv4: (ip: string) => ip !== '127.0.0.1',
 }));
 
-const { posterForUrl, hasMoovInHead } = await import('./poster.js');
+const { posterForUrl, hasMoovInHead, ffmpegArgs, ffprobeArgs, runForTests, SCALE_VF } =
+  await import('./poster.js');
 const { resolveUrl } = await import('./resolve.js');
 
 const ffmpegHere = spawnSync('ffmpeg', ['-version']).status === 0;
@@ -57,6 +60,8 @@ describe.skipIf(!ffmpegHere)('posters from a live origin', () => {
   let body: Buffer;
   let ranged = true;
   let asks: Array<string | undefined> = [];
+  /** What the origin CLAIMS the file's total is, when it is not the truth. */
+  let claimedTotal: number | null = null;
 
   beforeAll(async () => {
     dir = await mkdtemp(path.join(tmpdir(), 'poster-fixtures-'));
@@ -75,7 +80,7 @@ describe.skipIf(!ffmpegHere)('posters from a live origin', () => {
         res.writeHead(206, {
           'content-type': 'video/mp4',
           'content-length': String(slice.length),
-          'content-range': `bytes ${from}-${to}/${body.length}`,
+          'content-range': `bytes ${from}-${to}/${claimedTotal ?? body.length}`,
         });
         res.end(slice);
         return;
@@ -96,6 +101,7 @@ describe.skipIf(!ffmpegHere)('posters from a live origin', () => {
     body = bytes;
     ranged = withRanges;
     asks = [];
+    claimedTotal = null;
   }
 
   function poster(opts?: { headBytes?: number; tailBytes?: number }) {
@@ -178,6 +184,23 @@ describe.skipIf(!ffmpegHere)('posters from a live origin', () => {
   it('answers null for bytes that are not media, rather than failing anything', async () => {
     serve(Buffer.from('<html>this is no video</html>'), true);
     expect(await poster()).toBeNull();
+  });
+
+  it('refuses to build a sparse file around a total past the ceiling', async () => {
+    // ⚠ `materialize` truncates a file to whatever total the origin stated. On tmpfs a hole is
+    // free; on a filesystem without sparse support it is the whole claim, allocated.
+    serve(tailMp4, true);
+    claimedTotal = 2 ** 40;
+    expect(await poster({ headBytes: 64 * 1024 })).toBeNull();
+    // Refused before the tail fetch, not after.
+    expect(asks.length).toBe(1);
+  });
+
+  it('refuses an origin whose stated total is smaller than what it already sent', async () => {
+    serve(tailMp4, true);
+    claimedTotal = 16;
+    expect(await poster({ headBytes: 64 * 1024 })).toBeNull();
+    expect(asks.length).toBe(1);
   });
 
   it('rides /resolve as wantPoster, and only when asked', async () => {
@@ -294,7 +317,9 @@ describe.skipIf(!ffmpegHere)('HDR posters', () => {
     // only make it wrong, and SDR is almost everything.
     const sdr = path.join(dir, 'sdr.mkv');
     makeRamp(sdr, 'bt709', 'bt709', 'bt709');
-    expect(await posterFilter(sdr)).toBe(`scale='min(640,iw)':-2`);
+    expect(await posterFilter(sdr)).toBe(
+      `scale='min(640,iw)':'min(640,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`,
+    );
   });
 
   it('still produces a usable poster for an HDR clip', async () => {
@@ -341,13 +366,17 @@ describe.skipIf(!ffmpegHere)('the tone-map fallback', () => {
       // Sanity first: the plain chain really does decode this file, so a null below is the
       // fallback failing rather than the fixture being undecodable.
       expect(
-        await decodeWithFallbackForTests(file, false, `scale='min(640,iw)':-2`),
+        await decodeWithFallbackForTests(
+          file,
+          false,
+          `scale='min(640,iw)':'min(640,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`,
+        ),
       ).not.toBeNull();
 
       const frame = await decodeWithFallbackForTests(
         file,
         false,
-        `definitely_not_a_filter=1,scale='min(640,iw)':-2`,
+        `definitely_not_a_filter=1,scale='min(640,iw)':'min(640,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`,
       );
       expect(frame).not.toBeNull();
       expect(frame!.jpeg.length).toBeGreaterThan(0);
@@ -355,4 +384,180 @@ describe.skipIf(!ffmpegHere)('the tone-map fallback', () => {
       await rm(dir, { recursive: true, force: true }).catch(() => {});
     }
   });
+});
+
+describe('the child-process bounds', () => {
+  // These run everywhere: the argv is a pure function and `sleep` is on every host.
+
+  /** The value after `name`, in the given slice of the argv. */
+  const flag = (args: string[], name: string): string | undefined => {
+    const at = args.indexOf(name);
+    return at === -1 ? undefined : args[at + 1];
+  };
+
+  it('pins the ffmpeg flags: three thread caps, a frame cap, an allocation cap, files only', () => {
+    // ⚠⚠ `-threads 2` before `-i` capped the DECODER and nothing else; the filter graph and the
+    // encoder each defaulted to a thread per core, and the "two-thread" decode measured fifty
+    // threads on a 16-core host under a --pids-limit that counts threads. Each pool has its
+    // own flag and its own position in the argv.
+    const args = ffmpegArgs('/tmp/poster-x/in.bin', '0.5', SCALE_VF);
+    const at = args.indexOf('-i');
+    const input = args.slice(0, at);
+    const output = args.slice(at + 1);
+    expect(args[at + 1]).toBe('/tmp/poster-x/in.bin');
+    expect(flag(input, '-threads')).toBe('1'); // decoder
+    expect(flag(input, '-filter_threads')).toBe('1'); // filter graph
+    expect(flag(output, '-threads')).toBe('1'); // encoder
+    expect(flag(input, '-max_pixels')).toBe(String(7680 * 4320));
+    expect(Number(flag(input, '-max_alloc'))).toBeGreaterThan(0);
+    expect(flag(input, '-protocol_whitelist')).toBe('file');
+    expect(input).toContain('-nostdin');
+    expect(flag(input, '-ss')).toBe('0.5');
+    expect(flag(output, '-frames:v')).toBe('1');
+    expect(flag(output, '-vf')).toBe(SCALE_VF);
+    expect(output.slice(-3)).toEqual(['-f', 'mjpeg', 'pipe:1']);
+  });
+
+  it('pins the ffprobe flags the same way — it opens the decoder too', () => {
+    const args = ffprobeArgs('/tmp/poster-x/in.bin');
+    expect(flag(args, '-protocol_whitelist')).toBe('file');
+    expect(flag(args, '-threads')).toBe('1');
+    expect(flag(args, '-max_pixels')).toBe(String(7680 * 4320));
+    // ⚠ ffprobe reads the same hostile file FIRST; extradata can ask for a large allocation
+    // without touching the pixel cap (Codex).
+    expect(Number(flag(args, '-max_alloc'))).toBeGreaterThan(0);
+    expect(args.at(-1)).toBe('/tmp/poster-x/in.bin');
+  });
+
+  it('caps both axes of the scale, so a tall frame cannot leave at full height', () => {
+    // `scale='min(640,iw)':-2` capped the width alone: 100×60000 left at 100×60000.
+    expect(SCALE_VF).toContain(`'min(640,ih)'`);
+    expect(SCALE_VF).toContain('force_original_aspect_ratio=decrease');
+    expect(SCALE_VF).toContain('force_divisible_by=2');
+  });
+
+  it('kills the child on the caller’s abort instead of letting it run to its own timeout', async () => {
+    // ⚠ server.ts releases the resolve slot when its deadline fires. Before this the child
+    // chain it had started ran on — the "cap a timeout quietly lifts".
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = runForTests('sleep', ['10'], { signal: controller.signal });
+    setTimeout(() => controller.abort(), 50);
+    const out = await pending;
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(out.stdout.length).toBe(0);
+    expect(out.timedOut).toBe(false);
+  });
+
+  it('never spawns for a signal that is already aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const started = Date.now();
+    const out = await runForTests('sleep', ['10'], { signal: controller.signal });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(out.code).toBeNull();
+  });
+
+  it('drops output past the cap rather than buffering it', async () => {
+    const out = await runForTests('head', ['-c', String(6 * 1024 * 1024), '/dev/zero']);
+    expect(out.stdout.length).toBe(0);
+  });
+
+  it('answers "nothing" at once when the decode pool and its queue are full', async () => {
+    // Two run, twenty wait, the twenty-third is told no without waiting: a poster it cannot
+    // get a slot for in time is a card without one, never a resolve held hostage.
+    const controller = new AbortController();
+    const held = Array.from({ length: 22 }, () =>
+      runForTests('sleep', ['10'], { signal: controller.signal }),
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    const started = Date.now();
+    const refused = await runForTests('sleep', ['10'], { signal: controller.signal });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(refused.stdout.length).toBe(0);
+    controller.abort();
+    await Promise.all(held);
+  });
+});
+
+/**
+ * ⚠⚠ The README's `--pids-limit` paragraph is a claim about THIS: that one decode is a
+ * handful of threads. It was false — see `ffmpegArgs` — and the repository's rule is that a
+ * comment asserting a behaviour is a testable claim. Linux only, because `/proc/<pid>/task`
+ * is where threads are counted; the Docker test stage is Linux.
+ */
+describe.skipIf(!ffmpegHere || process.platform !== 'linux')('ffmpeg thread count', () => {
+  async function maxThreads(args: string[]): Promise<{ max: number; samples: number }> {
+    const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'ignore'] });
+    const closed = new Promise<void>((resolve) => child.on('close', () => resolve()));
+    let max = 0;
+    let samples = 0;
+    while (child.exitCode === null && child.signalCode === null) {
+      try {
+        const n = readdirSync(`/proc/${child.pid}/task`).length;
+        samples++;
+        if (n > max) max = n;
+      } catch {
+        // Exited between the check and the read.
+      }
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    await closed;
+    return { max, samples };
+  }
+
+  // ⚠ The probe is validated against the flags this replaces: the sampler must be able to SEE
+  // the per-core pools, or a bound of 8 is a number nothing checked. That needs cores.
+  it.skipIf(availableParallelism() < 4)(
+    'runs a decode on a handful of threads, where the old flags ran one per core',
+    async () => {
+      const dir = await mkdtemp(path.join(tmpdir(), 'poster-threads-'));
+      try {
+        // Big enough to decode for tens of milliseconds, so the sampler sees it running.
+        const file = path.join(dir, 'hd.mp4');
+        const enc = spawnSync('ffmpeg', [
+          '-nostdin',
+          '-loglevel',
+          'error',
+          '-f',
+          'lavfi',
+          '-i',
+          'testsrc=duration=2:size=1280x720:rate=30',
+          '-y',
+          file,
+        ]);
+        if (enc.status !== 0) throw new Error(`fixture encode failed: ${enc.stderr}`);
+
+        const fresh = await maxThreads(ffmpegArgs(file, '0.5', SCALE_VF));
+        expect(fresh.samples).toBeGreaterThan(0);
+        expect(fresh.max).toBeGreaterThanOrEqual(1);
+        // One on ffmpeg 5.1 (measured); a threaded-pipeline ffmpeg (6.1+) adds one per stage.
+        expect(fresh.max).toBeLessThanOrEqual(8);
+
+        const old = await maxThreads([
+          '-nostdin',
+          '-loglevel',
+          'error',
+          '-threads',
+          '2',
+          '-ss',
+          '0.5',
+          '-i',
+          file,
+          '-frames:v',
+          '1',
+          '-vf',
+          `scale='min(640,iw)':-2`,
+          '-q:v',
+          '4',
+          '-f',
+          'mjpeg',
+          'pipe:1',
+        ]);
+        expect(old.max).toBeGreaterThan(fresh.max);
+      } finally {
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+  );
 });

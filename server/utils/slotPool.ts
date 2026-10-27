@@ -47,7 +47,8 @@ export class SlotPool {
    * ⚠ A `false` means "we couldn't ask right now", never "this work is impossible". Callers
    * must not cache a verdict derived from it.
    */
-  async acquire(): Promise<boolean> {
+  async acquire(signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) return false;
     if (this.taken < this.cfg.size) {
       this.taken++;
       return true;
@@ -55,19 +56,29 @@ export class SlotPool {
     if (this.waiters.length >= this.cfg.maxQueued) return false;
 
     return await new Promise<boolean>((resolve) => {
+      // ⚠ A caller that stops wanting the slot leaves the queue at once. Without this an
+      // aborted resolve's decode sat parked for the full wait, counting against maxQueued
+      // while live callers were refused.
+      const giveUp = (): void => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        clearTimeout(waiter.timer);
+        signal?.removeEventListener('abort', giveUp);
+        const at = this.waiters.indexOf(waiter);
+        if (at !== -1) this.waiters.splice(at, 1);
+        // No decrement: this caller never held a slot, it was only queued for one.
+        resolve(false);
+      };
       const waiter: Waiter = {
         settled: false,
-        resolve,
-        timer: setTimeout(() => {
-          if (waiter.settled) return;
-          waiter.settled = true;
-          const at = this.waiters.indexOf(waiter);
-          if (at !== -1) this.waiters.splice(at, 1);
-          // No decrement: this caller never held a slot, it was only queued for one.
-          resolve(false);
-        }, this.cfg.waitMs),
+        resolve: (got) => {
+          signal?.removeEventListener('abort', giveUp);
+          resolve(got);
+        },
+        timer: setTimeout(giveUp, this.cfg.waitMs),
       };
       waiter.timer.unref?.();
+      signal?.addEventListener('abort', giveUp, { once: true });
       this.waiters.push(waiter);
     });
   }
