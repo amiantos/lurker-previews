@@ -38,7 +38,7 @@ export function isBlockedIpv4(ip: string): boolean {
   if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) {
     return true; // malformed → block, fail safe
   }
-  const [a, b] = parts;
+  const [a, b, c] = parts;
   if (a === 0) return true; // 0.0.0.0/8 "this network"
   if (a === 10) return true; // 10/8 private
   if (a === 127) return true; // loopback
@@ -46,6 +46,16 @@ export function isBlockedIpv4(ip: string): boolean {
   if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12 private
   if (a === 192 && b === 168) return true; // 192.168/16 private
   if (a === 100 && b >= 64 && b <= 127) return true; // 100.64/10 CGNAT
+  // RFC 6890 special-purpose blocks. None is routable on the public internet, and a corporate
+  // overlay or a benchmarking rig that borrows one is exactly the private space this guard
+  // is for. Verified: the URL parser leaves every one of these literal, so nothing upstream
+  // canonicalises them away.
+  if (a === 192 && b === 0 && c === 0) return true; // 192.0.0.0/24 IETF protocol assignments
+  if (a === 192 && b === 0 && c === 2) return true; // 192.0.2.0/24 TEST-NET-1
+  if (a === 192 && b === 88 && c === 99) return true; // 192.88.99.0/24 6to4 relay anycast
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmarking
+  if (a === 198 && b === 51 && c === 100) return true; // 198.51.100.0/24 TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true; // 203.0.113.0/24 TEST-NET-3
   if (a >= 224) return true; // 224/4 multicast + 240/4 reserved + 255.255.255.255 broadcast
   return false;
 }

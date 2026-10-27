@@ -142,3 +142,40 @@ describe('dimensionsFromHead: the numbers a client reserves a box from', () => {
     expect(await dimensionsFromHead(Buffer.from('not an image at all'))).toBeNull();
   });
 });
+
+describe('pageMeta vets every field the cell receives', () => {
+  // Built from code points: the tooling rewrites a Unicode escape in a string literal as the
+  // character itself, and these are the invisible ones.
+  const cp = (...codes: number[]): string => String.fromCodePoint(...codes);
+
+  it('strips raw control bytes and bidi overrides from scraped text', () => {
+    // ⚠ A literal 0x03 inside the content attribute survived TextDecoder, the whitespace
+    // collapse and the clamp: the entity guard only ever refused the numeric reference. The
+    // cell's renderer parses U+0003 as an mIRC colour code, so a page could format the
+    // message list.
+    const out = pageMeta(new URL('https://example.com/post'), null, {
+      title: `Hello${cp(0x03)},${cp(0x02)} world${cp(0x00)}`,
+      description: `${cp(0x202e)}gnp.ecioinvi${cp(0x202c)} ${cp(0x2014)} a${cp(0x200b)}b`,
+      siteName: `Site${cp(0x85)}Name`,
+    });
+    expect(out).not.toBeNull();
+    expect(out!.title).toBe('Hello, world');
+    expect(out!.description).toBe(`gnp.ecioinvi ${cp(0x2014)} ab`);
+    expect(out!.siteName).toBe('SiteName');
+  });
+
+  it('vets the oEmbed path too', () => {
+    const out = pageMeta(
+      new URL('https://example.com/post'),
+      {
+        title: `${cp(0x03)}Rock & Roll`,
+        authorName: `A${cp(0x00)}B`,
+        providerName: `P${cp(0x202e)}x`,
+      },
+      {},
+    );
+    expect(out!.title).toBe('Rock & Roll');
+    expect(out!.author).toBe('AB');
+    expect(out!.siteName).toBe('Px');
+  });
+});

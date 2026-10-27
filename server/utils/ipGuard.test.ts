@@ -20,6 +20,13 @@ describe('isBlockedIpv4', () => {
       '172.31.255.255',
       '192.168.1.1',
       '100.64.0.1', // CGNAT
+      '192.0.0.8', // RFC 6890 IETF protocol assignments
+      '192.0.2.1', // TEST-NET-1
+      '192.88.99.1', // 6to4 relay anycast
+      '198.18.0.1', // benchmarking
+      '198.19.255.255',
+      '198.51.100.1', // TEST-NET-2
+      '203.0.113.1', // TEST-NET-3
       '224.0.0.1', // multicast
       '255.255.255.255',
     ]) {
@@ -28,7 +35,18 @@ describe('isBlockedIpv4', () => {
   });
 
   it('allows ordinary public addresses', () => {
-    for (const ip of ['8.8.8.8', '1.1.1.1', '172.15.0.1', '172.32.0.1', '100.63.0.1']) {
+    for (const ip of [
+      '8.8.8.8',
+      '1.1.1.1',
+      '172.15.0.1',
+      '172.32.0.1',
+      '100.63.0.1',
+      '192.0.1.1', // beside the RFC 6890 blocks, not inside them
+      '192.0.3.1',
+      '198.17.255.255',
+      '198.20.0.1',
+      '203.0.114.1',
+    ]) {
       expect(isBlockedIpv4(ip)).toBe(false);
     }
   });

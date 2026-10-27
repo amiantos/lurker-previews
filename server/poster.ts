@@ -10,22 +10,25 @@
 // yielded a real first frame from 8.3% of its bytes, a faststart mp4 from 1.8%.
 // What changed is WHO fetches: the prototype had bytes POSTed in; this service
 // fetches them itself, through the same SSRF-guarded, DNS-pinned client as every
-// other origin touch. ⚠ ffmpeg NEVER fetches — it is handed a local file. Its own
-// protocol handlers would be a second, unguarded network client in the exact
-// process this architecture exists to contain.
+// other origin touch. ⚠ ffmpeg NEVER fetches — it is handed a local file, and
+// `-protocol_whitelist file` makes that a property of the invocation rather than
+// of the argument (see `ffmpegArgs`). Its own protocol handlers would be a second,
+// unguarded network client in the exact process this architecture exists to contain.
 //
 // ⚠⚠ Best-effort BY CONTRACT. Every failure — no ranges, no index in reach, no
-// decodable frame, no ffmpeg, over budget — returns null, and null means "a card
-// with no poster", which is a complete state. Nothing here may fail a resolve.
+// decodable frame, no ffmpeg, over budget, no decode slot — returns null, and null
+// means "a card with no poster", which is a complete state. Nothing here may fail
+// a resolve.
 
 import { spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
 import { mkdtemp, open, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import sharp from 'sharp';
+import sharp from './utils/sharp.js';
 import { bufferStream, safeRequest } from './services/linkFetch.js';
 import { SlotPool } from './utils/slotPool.js';
+import { envInt } from './utils/env.js';
 import { contentRangeTotal } from './fetchImage.js';
 
 /** How much of the front to take: enough for a faststart index plus the first keyframe.
@@ -36,9 +39,47 @@ const HEAD_BYTES = 1024 * 1024;
 const TAIL_BYTES = 512 * 1024;
 /** Wall-clock ceiling for one ffmpeg decode. A container format can describe an enormous
  *  amount of work in very few bytes, so the bound has to be time, not input size. */
-const DECODE_TIMEOUT_MS = Number(process.env.LURKER_PREVIEWS_POSTER_TIMEOUT_MS ?? 5_000);
+const DECODE_TIMEOUT_MS = envInt('LURKER_PREVIEWS_POSTER_TIMEOUT_MS', 5_000);
 /** Longest edge of the poster. A card thumbnail, not a frame grab for archival. */
 const POSTER_MAX_EDGE = 640;
+
+/**
+ * The largest frame a decoder may allocate: 8K (7680×4320). ffmpeg's default is INT_MAX,
+ * and the allocation happens on the strength of a container header, before a pixel is read
+ * — so a few bytes could claim a frame of hundreds of MB inside a 512 MB container where the
+ * OOM killer may well pick node over the child.
+ */
+const MAX_FRAME_PIXELS = 7680 * 4320;
+/** The largest single allocation ffmpeg may make. An 8K RGB frame is ~100 MB. */
+const MAX_ALLOC_BYTES = 128 * 1024 * 1024;
+/** The most pixels a poster can be, for sharp's reads of OUR OWN encoder's output: 640² plus
+ *  the even-rounding of `force_divisible_by`. Not a cap on the video; a cap on the JPEG. */
+const MAX_POSTER_PIXELS = 2 * POSTER_MAX_EDGE * POSTER_MAX_EDGE;
+/** A poster is tens of KB. Child output past this is not a frame, whatever it is. */
+const MAX_STDOUT_BYTES = 4 * 1024 * 1024;
+/**
+ * Longest declared file this will build a sparse window for. The origin names the total
+ * (Content-Range, or Content-Length on a 200) and `materialize` truncates a file to it; on
+ * tmpfs a hole is free, but a self-hoster who drops `--tmpfs /tmp` onto a filesystem without
+ * sparse support allocates the whole claim. 4 GiB is past any clip a phone records.
+ */
+const MAX_DECLARED_TOTAL = 4 * 1024 * 1024 * 1024;
+
+/**
+ * Decodes in flight — ffprobe and ffmpeg alike; EVERY child goes through `run`.
+ *
+ * ⚠⚠ Before this pool the only bound on concurrent children was the resolve pool's twenty
+ * slots, and the thread cap below was a quarter of the story: measured on a 16-core host,
+ * each `-threads 2` ffmpeg ran FIFTY threads, because that flag capped the decoder alone and
+ * the filter graph and the encoder each defaulted to a thread per core. Twenty of those is a
+ * thousand threads against `--pids-limit 128`; every spawn past the limit fails EAGAIN and
+ * reports as a silently posterless card — and so does every avatar decode and DNS lookup in
+ * the same cgroup. Two at a time, each now provably single-threaded, is a bound that holds.
+ *
+ * A poster that cannot get a slot in time keeps the verdict it has: no poster. Never a
+ * failed resolve.
+ */
+const decodePool = new SlotPool({ size: 2, maxQueued: 20, waitMs: 5_000 });
 
 export interface PosterOptions {
   headBytes?: number;
@@ -89,7 +130,7 @@ export function hasMoovInHead(buf: Buffer): boolean {
  * ranges cannot simply be concatenated, because every offset inside `moov` is absolute against
  * the original file. Writing them into a file of the ORIGINAL LENGTH preserves those offsets
  * exactly; the hole in between is never read for a first-frame decode, and on any modern
- * filesystem it occupies no blocks.
+ * filesystem it occupies no blocks. `total` is bounded by MAX_DECLARED_TOTAL before this runs.
  */
 async function materialize(
   dir: string,
@@ -115,29 +156,83 @@ async function materialize(
   return file;
 }
 
-/** Run a binary with a hard timeout, collecting stdout. Never rejects on a non-zero exit —
- *  a refusal to decode is an ANSWER here, not an exception. */
-function run(
-  bin: string,
-  args: string[],
-): Promise<{ code: number | null; stdout: Buffer; timedOut: boolean }> {
+/** What a child run is bound by: the caller's abort, and where it may look. */
+export interface RunContext {
+  signal?: AbortSignal;
+  /** The temp directory, so a relative path the demuxer might open resolves inside it. */
+  cwd?: string;
+}
+
+interface RunResult {
+  code: number | null;
+  stdout: Buffer;
+  timedOut: boolean;
+}
+
+const NOTHING: RunResult = { code: null, stdout: Buffer.alloc(0), timedOut: false };
+
+/**
+ * Run a binary under the decode pool, with a hard timeout, collecting stdout. Never rejects
+ * on a non-zero exit — a refusal to decode is an ANSWER here, not an exception.
+ *
+ * ⚠⚠ Killed on the caller's abort. `server.ts` wraps the whole resolve in a deadline that
+ * releases the resolve slot when it fires; before this the child chain it had started kept
+ * running to its own end — up to eight ffmpeg/ffprobe runs of DECODE_TIMEOUT_MS each —
+ * while the slot was handed to the next caller. "A cap that a timeout quietly lifts is not a
+ * cap" (server.ts), and this is the hook that makes the release honest.
+ */
+async function run(bin: string, args: string[], ctx: RunContext = {}): Promise<RunResult> {
+  if (ctx.signal?.aborted) return NOTHING;
+  if (!(await decodePool.acquire())) return NOTHING;
+  try {
+    if (ctx.signal?.aborted) return NOTHING;
+    return await spawnBounded(bin, args, ctx);
+  } finally {
+    decodePool.release();
+  }
+}
+
+/** Test seam: the pool, the abort and the output cap are the properties, and none of them
+ *  can be seen from a poster. */
+export const runForTests = run;
+
+function spawnBounded(bin: string, args: string[], ctx: RunContext): Promise<RunResult> {
   return new Promise((resolve) => {
-    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'ignore'], cwd: ctx.cwd });
     const chunks: Buffer[] = [];
+    let seen = 0;
     let timedOut = false;
+    let killed = false;
+    const kill = (): void => {
+      if (killed) return;
+      killed = true;
+      child.kill('SIGKILL');
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGKILL');
+      kill();
     }, DECODE_TIMEOUT_MS);
-    child.stdout.on('data', (c: Buffer) => chunks.push(c));
-    child.on('error', () => {
+    const onAbort = (): void => kill();
+    ctx.signal?.addEventListener('abort', onAbort, { once: true });
+    const finish = (result: RunResult): void => {
       clearTimeout(timer);
-      resolve({ code: null, stdout: Buffer.alloc(0), timedOut });
+      ctx.signal?.removeEventListener('abort', onAbort);
+      resolve(result);
+    };
+    child.stdout.on('data', (c: Buffer) => {
+      seen += c.length;
+      if (seen > MAX_STDOUT_BYTES) {
+        kill();
+        return;
+      }
+      chunks.push(c);
     });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ code, stdout: Buffer.concat(chunks), timedOut });
-    });
+    child.on('error', () => finish({ code: null, stdout: Buffer.alloc(0), timedOut }));
+    // ⚠ A killed child's partial output is NOT a frame: a JPEG cut off mid-scan would pass the
+    // "did we get bytes" test and ship as a poster.
+    child.on('close', (code) =>
+      finish({ code, stdout: killed ? Buffer.alloc(0) : Buffer.concat(chunks), timedOut }),
+    );
   });
 }
 
@@ -166,7 +261,7 @@ export function ffmpegAvailable(): Promise<boolean> {
  */
 export async function looksFlat(jpeg: Buffer): Promise<boolean> {
   try {
-    const stats = await sharp(jpeg).stats();
+    const stats = await sharp(jpeg, { limitInputPixels: MAX_POSTER_PIXELS }).stats();
     return stats.channels.every((c) => c.stdev < 2);
   } catch {
     // Unreadable by sharp: not this heuristic's call. The cell's signature check is the
@@ -176,19 +271,14 @@ export async function looksFlat(jpeg: Buffer): Promise<boolean> {
 }
 
 /**
- * Decode one frame to JPEG.
+ * Longest edge clamped on BOTH axes, aspect preserved, never upscaled. The tail of every chain.
  *
- * ⚠ `-ss` BEFORE `-i` so the seek is done by demuxing rather than by decoding every frame up to
- * the mark — on a long file the difference is seconds against milliseconds.
- *
- * ⚠ The seek ORDER depends on how much of the file we hold. For a whole file, 0.5 s first: some
- * encoders have no decodable frame exactly at zero, and a seek to 0 is frequently a no-op. For a
- * WINDOWED file — head and maybe tail, hole in between — frame 0 is the only sample whose bytes
- * are guaranteed inside the head, so it goes first; 0.5 s may be past the window entirely on a
- * high-bitrate clip, which is precisely the flat-gray case `looksFlat` exists to catch.
+ * ⚠ Both axes. `scale='min(640,iw)':-2` capped the width alone, so a 100×60000 frame came out
+ * at full height — 42 MP of MJPEG for sharp to read back. `force_original_aspect_ratio=
+ * decrease` fits the frame inside the box; `force_divisible_by=2` keeps the encoder's even
+ * dimensions, which `-2` used to supply (verified: 1281×721 → 640×360, 100×2000 → 32×640).
  */
-/** Longest edge clamped, aspect preserved, never upscaled. The tail of every chain. */
-const SCALE_VF = `scale='min(${POSTER_MAX_EDGE},iw)':-2`;
+export const SCALE_VF = `scale='min(${POSTER_MAX_EDGE},iw)':'min(${POSTER_MAX_EDGE},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`;
 
 /**
  * The HDR→SDR tone map, in front of the scale.
@@ -236,6 +326,86 @@ const TONEMAP_VF =
 const HDR_TRANSFERS = new Set(['smpte2084', 'arib-std-b67']);
 
 /**
+ * The ffprobe invocation. Exported so the test can pin the flags that bound it.
+ *
+ * ⚠ The same containment flags as ffmpeg's: ffprobe opens the decoder to read stream info,
+ * so it allocates frames and spawns threads exactly as a decode would.
+ */
+export function ffprobeArgs(file: string): string[] {
+  return [
+    '-v',
+    'error',
+    '-protocol_whitelist',
+    'file',
+    '-threads',
+    '1',
+    '-max_pixels',
+    String(MAX_FRAME_PIXELS),
+    '-select_streams',
+    'v:0',
+    '-show_entries',
+    'stream=color_transfer',
+    '-of',
+    'default=nw=1:nk=1',
+    file,
+  ];
+}
+
+/**
+ * The ffmpeg invocation for one frame. Exported so the test can pin the flags that bound it
+ * — a thread cap that only looked like one is how this list came to be written out.
+ *
+ * ⚠⚠ THREE thread caps, because ffmpeg has three thread pools and `-threads` before `-i`
+ * reaches only the first. The decoder takes the input-side `-threads`; the filter graph
+ * takes `-filter_threads`; the encoder takes the output-side `-threads`, after `-i`. The
+ * last two default to a thread per core, which on a 16-core host made a "`-threads 2`"
+ * decode a 50-thread process under a `--pids-limit` that counts threads. One of each: this
+ * is ONE frame at card size, not a transcode, and the measured cost of single-threading it
+ * is nothing.
+ *
+ * ⚠ `-protocol_whitelist file`, before `-i`: ffmpeg picks the demuxer from the BYTES, not from
+ * the content type the origin declared, and a playlist (HLS, concat) is a valid input whose
+ * entries name other files. The default nested whitelist already stops `http:`; this states
+ * the policy instead of inheriting it, and drops `data:` and `crypto:` with it. `cwd` is the
+ * temp directory for the same reason: a relative segment path resolves there and nowhere else.
+ *
+ * ⚠ `-max_pixels` and `-max_alloc`: a container header declares the frame size and the
+ * decoder allocates it before reading a pixel. ffmpeg's defaults are INT_MAX for both.
+ */
+export function ffmpegArgs(file: string, ss: string, vf: string): string[] {
+  return [
+    '-nostdin',
+    '-loglevel',
+    'error',
+    '-max_alloc',
+    String(MAX_ALLOC_BYTES),
+    '-protocol_whitelist',
+    'file',
+    '-threads',
+    '1',
+    '-filter_threads',
+    '1',
+    '-max_pixels',
+    String(MAX_FRAME_PIXELS),
+    '-ss',
+    ss,
+    '-i',
+    file,
+    '-frames:v',
+    '1',
+    '-vf',
+    vf,
+    '-threads',
+    '1',
+    '-q:v',
+    '4',
+    '-f',
+    'mjpeg',
+    'pipe:1',
+  ];
+}
+
+/**
  * Does this file need tone mapping?
  *
  * ⚠ Answered from the stream's own tag rather than guessed from the pixels, and it decides
@@ -246,54 +416,32 @@ const HDR_TRANSFERS = new Set(['smpte2084', 'arib-std-b67']);
  * ffprobe, a container header still inside the sparse window's hole, a codec it cannot
  * parse) must not cost us a poster we would otherwise have produced.
  */
-async function needsToneMap(file: string): Promise<boolean> {
-  const { stdout } = await run('ffprobe', [
-    '-v',
-    'error',
-    '-select_streams',
-    'v:0',
-    '-show_entries',
-    'stream=color_transfer',
-    '-of',
-    'default=nw=1:nk=1',
-    file,
-  ]);
+async function needsToneMap(file: string, ctx: RunContext): Promise<boolean> {
+  const { stdout } = await run('ffprobe', ffprobeArgs(file), ctx);
   return HDR_TRANSFERS.has(stdout.toString('utf8').trim());
 }
 
+/**
+ * Decode one frame to JPEG.
+ *
+ * ⚠ `-ss` BEFORE `-i` so the seek is done by demuxing rather than by decoding every frame up to
+ * the mark — on a long file the difference is seconds against milliseconds.
+ *
+ * ⚠ The seek ORDER depends on how much of the file we hold. For a whole file, 0.5 s first: some
+ * encoders have no decodable frame exactly at zero, and a seek to 0 is frequently a no-op. For a
+ * WINDOWED file — head and maybe tail, hole in between — frame 0 is the only sample whose bytes
+ * are guaranteed inside the head, so it goes first; 0.5 s may be past the window entirely on a
+ * high-bitrate clip, which is precisely the flat-gray case `looksFlat` exists to catch.
+ */
 async function decodeFrame(
   file: string,
   windowed: boolean,
-  vf: string = SCALE_VF,
+  vf: string,
+  ctx: RunContext,
 ): Promise<{ jpeg: Buffer; flat: boolean } | null> {
   let flatFallback: Buffer | null = null;
   for (const ss of windowed ? ['0', '0.5'] : ['0.5', '0']) {
-    const { stdout } = await run('ffmpeg', [
-      '-nostdin',
-      '-loglevel',
-      'error',
-      // ⚠⚠ Capped, because ffmpeg's default is one decode thread PER CORE and the container
-      // runs under --pids-limit, which counts THREADS. On a 16-core host an uncapped decode
-      // plus node's own pool overran a 64-pid budget and every thread spawn failed EAGAIN —
-      // which this path reports as "no poster", silently, since a missing poster is a
-      // supported state. Found in local QA as "no posters anywhere" with nothing in any log.
-      // Two threads is plenty: this is ONE frame at card size, not a transcode.
-      '-threads',
-      '2',
-      '-ss',
-      ss,
-      '-i',
-      file,
-      '-frames:v',
-      '1',
-      '-vf',
-      vf,
-      '-q:v',
-      '4',
-      '-f',
-      'mjpeg',
-      'pipe:1',
-    ]);
+    const { stdout } = await run('ffmpeg', ffmpegArgs(file, ss, vf), ctx);
     // ⚠ Judged on OUTPUT, not on the exit code. ffmpeg exits non-zero on a truncated input while
     // still having written a perfectly good frame — which is the normal case here, since the
     // file it was handed is deliberately incomplete.
@@ -319,8 +467,8 @@ async function decodeFrame(
  * tried. This asserts the decision and the wiring, which are the parts that can regress
  * silently; the picture itself wants a real clip and a pair of eyes.
  */
-export async function posterFilter(file: string): Promise<string> {
-  return (await needsToneMap(file)) ? `${TONEMAP_VF},${SCALE_VF}` : SCALE_VF;
+export async function posterFilter(file: string, ctx: RunContext = {}): Promise<string> {
+  return (await needsToneMap(file, ctx)) ? `${TONEMAP_VF},${SCALE_VF}` : SCALE_VF;
 }
 
 /**
@@ -341,10 +489,11 @@ async function decodeWithFallback(
   file: string,
   windowed: boolean,
   vf: string,
+  ctx: RunContext = {},
 ): Promise<{ jpeg: Buffer; flat: boolean } | null> {
-  const frame = await decodeFrame(file, windowed, vf);
+  const frame = await decodeFrame(file, windowed, vf, ctx);
   if (frame || vf === SCALE_VF) return frame;
-  return decodeFrame(file, windowed, SCALE_VF);
+  return decodeFrame(file, windowed, SCALE_VF, ctx);
 }
 
 /** Test seam: the fallback is only reachable with a chain ffmpeg refuses, which the image
@@ -353,9 +502,7 @@ export const decodeWithFallbackForTests = decodeWithFallback;
 
 /** Ceiling on a WHOLE-file fallback fetch. Matches the relay cap video had before the media
  *  policy retired it — the last size anyone blessed for moving one clip's bytes once. */
-const FULL_FETCH_MAX_BYTES = Number(
-  process.env.LURKER_PREVIEWS_POSTER_FULL_FETCH_BYTES ?? 64 * 1024 * 1024,
-);
+const FULL_FETCH_MAX_BYTES = envInt('LURKER_PREVIEWS_POSTER_FULL_FETCH_BYTES', 64 * 1024 * 1024);
 /**
  * Whole-file fetches in flight. ⚠ /tmp is tmpfs in the shipped container, so a "file" here is
  * RAM — twenty concurrent 46 MB pulls is the memory limit exceeded, not a busy disk. Two at a
@@ -459,13 +606,18 @@ export async function posterForUrl(
       ? contentRangeTotal(res.headers['content-range'] as string | undefined)
       : 'unknown';
     const declared = Number(res.headers['content-length']);
-    total =
+    const stated =
       typeof fromRange === 'number'
         ? fromRange
         : !ranged && Number.isSafeInteger(declared)
           ? declared
-          : head.length;
-    if (total < head.length) total = head.length;
+          : null;
+    // ⚠ An origin whose stated total is SMALLER than what it has already sent is lying, and a
+    // total that was merely clamped up to the bytes in hand would build a sparse file around
+    // a claim nothing else about the response supports. No poster.
+    if (stated !== null && stated < head.length) return null;
+    total = stated ?? head.length;
+    if (total > MAX_DECLARED_TOTAL) return null;
 
     const wholeFile = head.length >= total;
     if (!wholeFile && ranged && !hasMoovInHead(head)) {
@@ -488,11 +640,12 @@ export async function posterForUrl(
   }
 
   const dir = await mkdtemp(path.join(tmpdir(), 'poster-'));
+  const ctx: RunContext = { signal, cwd: dir };
   try {
     const file = await materialize(dir, total, head, tail);
     const windowed = head.length < total;
     // ⚠ Probed once per poster, not per seek attempt — `decodeFrame` tries two offsets.
-    let frame = await decodeWithFallback(file, windowed, await posterFilter(file));
+    let frame = await decodeWithFallback(file, windowed, await posterFilter(file, ctx), ctx);
     // The window didn't hold a real frame (or held only the hole's flat gray). Go get the
     // whole file — through the guard — and let ffmpeg pick its frame with everything there.
     if (windowed && (!frame || frame.flat)) {
@@ -503,7 +656,8 @@ export async function posterForUrl(
       // the head fetch would carry that "SDR" verdict into the one decode that has all the
       // bytes. One ffprobe, on a path that has just pulled the entire file over the network.
       if (whole)
-        frame = (await decodeWithFallback(whole, false, await posterFilter(whole))) ?? frame;
+        frame =
+          (await decodeWithFallback(whole, false, await posterFilter(whole, ctx), ctx)) ?? frame;
     }
     if (!frame) return null;
     const jpeg = frame.jpeg;
@@ -511,7 +665,7 @@ export async function posterForUrl(
     // image dimensions on the resolve path. This JPEG is OUR OWN encoder's output, not origin
     // bytes, but it still goes through sharp's metadata read only, never a decode-and-render.
     try {
-      const meta = await sharp(jpeg).metadata();
+      const meta = await sharp(jpeg, { limitInputPixels: MAX_POSTER_PIXELS }).metadata();
       return { jpeg, width: meta.width ?? null, height: meta.height ?? null };
     } catch {
       return { jpeg, width: null, height: null };

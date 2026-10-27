@@ -26,8 +26,9 @@
 // exists to prevent, which would now be happening across a process boundary
 // where it is harder to see.
 
-import sharp from 'sharp';
+import sharp from './utils/sharp.js';
 import { dimensionsFromHeader } from './utils/imageHeader.js';
+import { vetText } from './utils/vetText.js';
 import {
   bufferStream,
   fetchBuffered,
@@ -106,7 +107,9 @@ export type ResolveVerdict =
  */
 function clamp(value: string | undefined, max: number): string | null {
   if (!value) return null;
-  const trimmed = value.trim();
+  // ⚠ Vetted BEFORE the clamp, never after: NFC can change a string's length, and the cell
+  // trusts these arrive within the bound. See vetText.ts for what is removed and why.
+  const trimmed = vetText(value);
   if (!trimmed) return null;
   // ⚠ The cheap check FIRST. A code point is never fewer than one UTF-16 code unit, so
   // `length <= max` is an exact proof that no clamp is needed — and it is O(1) where

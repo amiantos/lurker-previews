@@ -1,6 +1,6 @@
 {
   "name": "lurker-previews",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Lurker's link-preview decoder: fetches, scrapes, measures and decodes hostile bytes so the cell never has to",
   "license": "MPL-2.0",
   "type": "module",
@@ -16,15 +16,15 @@
     "check": "npm run typecheck && npm run lint && npm run format:check"
   },
   "dependencies": {
-    "sharp": "^0.35.3",
+    "sharp": "^0.35.5",
     "tsx": "^4.23.1"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
-    "oxfmt": "^0.61.0",
-    "oxlint": "^1.42.0",
+    "oxfmt": "^0.75.0",
+    "oxlint": "^1.90.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.7"
+    "vitest": "^5.0.5"
   },
   "engines": {
     "node": ">=22"
