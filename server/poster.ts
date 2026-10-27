@@ -347,13 +347,16 @@ const HDR_TRANSFERS = new Set(['smpte2084', 'arib-std-b67']);
 /**
  * The ffprobe invocation. Exported so the test can pin the flags that bound it.
  *
- * ⚠ The same containment flags as ffmpeg's: ffprobe opens the decoder to read stream info,
+ * ⚠ The same containment flags as ffmpeg's, allocation cap included: ffprobe opens the
+ * decoder to read stream info,
  * so it allocates frames and spawns threads exactly as a decode would.
  */
 export function ffprobeArgs(file: string): string[] {
   return [
     '-v',
     'error',
+    '-max_alloc',
+    String(MAX_ALLOC_BYTES),
     '-protocol_whitelist',
     'file',
     '-threads',

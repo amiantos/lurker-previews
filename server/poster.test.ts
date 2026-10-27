@@ -423,6 +423,9 @@ describe('the child-process bounds', () => {
     expect(flag(args, '-protocol_whitelist')).toBe('file');
     expect(flag(args, '-threads')).toBe('1');
     expect(flag(args, '-max_pixels')).toBe(String(7680 * 4320));
+    // ⚠ ffprobe reads the same hostile file FIRST; extradata can ask for a large allocation
+    // without touching the pixel cap (Codex).
+    expect(Number(flag(args, '-max_alloc'))).toBeGreaterThan(0);
     expect(args.at(-1)).toBe('/tmp/poster-x/in.bin');
   });
 

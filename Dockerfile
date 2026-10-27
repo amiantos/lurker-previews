@@ -29,10 +29,12 @@ RUN apt-get update \
 
 COPY package*.json ./
 RUN npm ci
-# ⚠ A known-vulnerable RUNTIME dependency fails the build here rather than shipping.
-# This is how sharp 0.35.3 sat two security releases behind for two months: nothing
-# looked. Dev-only advisories are not gated (they never reach the runtime image) but
-# Dependabot opens a PR for them all the same.
+# ⚠ A known-vulnerable RUNTIME dependency fails a LOCAL `docker build --target test`
+# here. This is how sharp 0.35.3 sat two security releases behind for two months:
+# nothing looked. ⚠ Not the CI gate: this layer is cached on an unchanged lockfile and
+# would not re-query the advisory database — the workflow runs the same audit on the
+# runner, uncached, before building. Dev-only advisories are not gated (they never
+# reach the runtime image) but Dependabot opens a PR for them all the same.
 RUN npm audit --omit=dev --audit-level=high
 COPY tsconfig.json vitest.config.ts ./
 COPY server/ ./server/

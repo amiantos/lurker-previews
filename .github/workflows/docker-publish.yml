@@ -32,6 +32,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # ⚠ On the RUNNER, not in a Docker layer: the test stage also runs `npm audit`, but with
+      # `cache-from: type=gha` an unchanged package-lock.json reuses that layer without ever
+      # asking the advisory database again, so a new advisory would not stop a push (Codex).
+      - name: Audit runtime dependencies
+        run: npm ci --ignore-scripts --omit=dev && npm audit --omit=dev --audit-level=high
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
