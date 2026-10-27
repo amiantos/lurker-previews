@@ -15,7 +15,10 @@ import { APP_VERSION } from './utils/userAgent.js';
 
 const PORT = envInt('PORT', 8030, { min: 1, max: 65535 });
 /** How often the egress probes repeat. Ten minutes: a lapsed firewall is a 503 within that. */
-const SELFTEST_INTERVAL_MS = envInt('LURKER_PREVIEWS_SELFTEST_INTERVAL_MS', 10 * 60_000);
+const SELFTEST_INTERVAL_MS = envInt('LURKER_PREVIEWS_SELFTEST_INTERVAL_MS', 10 * 60_000, {
+  min: 1,
+  max: 2 ** 31 - 1, // node clamps a longer timer to 1 ms
+});
 
 const state: ServerState = { ready: false, reason: 'self-test has not run yet\n' };
 const server = createServer(state);

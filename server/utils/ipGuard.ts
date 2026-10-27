@@ -178,6 +178,10 @@ export function isBlockedIpLiteral(host: string): boolean {
   // fiddly, and a preview fetcher has no business dialling a tunnel broker either way. Blocking
   // costs us nothing real and removes a whole class of notation from the audit.
   if (groups[0] === 0x2002) return true; // 2002::/16 — 6to4
+  // The IPv6 twins of the RFC 6890 IPv4 blocks, also inside 2000::/3: documentation space and
+  // the benchmarking range, borrowed by the same overlays and rigs.
+  if (groups[0] === 0x2001 && groups[1] === 0x0db8) return true; // 2001:db8::/32
+  if (groups[0] === 0x2001 && groups[1] === 0x0002 && groups[2] === 0) return true; // 2001:2::/48
   if (groups[0] === 0x2001 && groups[1] === 0x0000) return true; // 2001:0::/32 — Teredo
 
   // ALLOWLIST: 2000::/3 is the global unicast range. Loopback (::1), the

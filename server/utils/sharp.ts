@@ -16,7 +16,8 @@
 //   Svg      — a document format that runs script; never a picture here (see resolve.ts).
 //   Tiff     — no browser renders it, so nothing a client could show is lost, and libtiff
 //              has the longest CVE record of the bundled decoders.
-//   Pdf, Magick, Fits, Openslide, Mat, Nifti, Analyze, Rad, Ppm, Csv, Matrix, Vips —
+//   Pdf, Magick, Fits, Openslide, Mat, Nifti, Analyze, Rad, Ppm, Csv, Matrix, Vips, Jxl,
+//   Jp2k —
 //              absent from sharp's prebuilt libvips, present in a system one (a self-hoster
 //              building against `SHARP_FORCE_GLOBAL_LIBVIPS`); none is an image anyone
 //              pastes into IRC. Blocking a loader libvips does not have is a no-op, so the
@@ -46,6 +47,8 @@ export const BLOCKED_LOADERS: readonly string[] = [
   'VipsForeignLoadCsv',
   'VipsForeignLoadMatrix',
   'VipsForeignLoadVips',
+  'VipsForeignLoadJxl',
+  'VipsForeignLoadJp2k',
 ];
 
 sharp.block({ operation: [...BLOCKED_LOADERS] });

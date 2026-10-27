@@ -29,7 +29,7 @@ describe('vetText', () => {
     expect(vetText(`${rlo}gnp.ecioinvi${pdf}`)).toBe('gnp.ecioinvi');
     expect(vetText(`a${lri}b${pdi}c`)).toBe('abc');
     expect(vetText(`soft${shy}hyphen zero${zwsp}width ${bom}bom`)).toBe('softhyphen zerowidth bom');
-    expect(vetText(`tag${cp(0xe0041)}chars`)).toBe('tagchars');
+    expect(vetText(`a${cp(0x2060)}b${cp(0x2062)}c`)).toBe('abc');
   });
 
   it('keeps the format characters that carry meaning', () => {
@@ -39,10 +39,18 @@ describe('vetText', () => {
     expect(vetText(conjunct)).toBe(conjunct);
     const marks = `a${lrm}b${rlm}c${alm}d${zwnj}e`;
     expect(vetText(marks)).toBe(marks);
+    // ⚠ The emoji TAG characters are format characters too: the England flag is U+1F3F4 plus
+    // seven of them. `\p{Cf}` stripped them and shipped a plain black flag (code review).
+    const england = cp(0x1f3f4, 0xe0067, 0xe0062, 0xe0065, 0xe006e, 0xe0067, 0xe007f);
+    expect(vetText(england)).toBe(england);
+    const arabicNumberSign = `${cp(0x600)}${cp(0x661)}`;
+    expect(vetText(arabicNumberSign)).toBe(arabicNumberSign);
   });
 
   it('normalises to NFC and collapses whitespace', () => {
     expect(vetText(`e${cp(0x301)}`)).toBe(cp(0xe9));
+    // ⚠ Normalised LAST: a strip between base and mark must still leave composed output.
+    expect(vetText(`e${cp(0x200b)}${cp(0x301)}`)).toBe(cp(0xe9));
     expect(vetText('  two\t\n words  ')).toBe('two words');
   });
 

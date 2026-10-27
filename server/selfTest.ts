@@ -211,6 +211,9 @@ export function superviseContainment(
     try {
       const list = targets();
       const result = await runSelfTest(list, opts.env);
+      // The dev escape hatch probes nothing; repeating its warning every interval only teaches
+      // the operator to skim past the line that matters.
+      if (result.skipped) clearInterval(timer);
       if (result.passed) {
         if (!state.ready) {
           const how = result.skipped
@@ -235,9 +238,9 @@ export function superviseContainment(
       running = false;
     }
   };
-  const first = check();
   const timer = setInterval(() => void check(), opts.intervalMs);
   timer.unref();
+  const first = check();
   return { stop: () => clearInterval(timer), first };
 }
 

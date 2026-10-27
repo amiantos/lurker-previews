@@ -39,7 +39,12 @@ const HEAD_BYTES = 1024 * 1024;
 const TAIL_BYTES = 512 * 1024;
 /** Wall-clock ceiling for one ffmpeg decode. A container format can describe an enormous
  *  amount of work in very few bytes, so the bound has to be time, not input size. */
-const DECODE_TIMEOUT_MS = envInt('LURKER_PREVIEWS_POSTER_TIMEOUT_MS', 5_000);
+/** ⚠ Capped below 2^31 ms: node clamps a longer timer to 1 ms, the exact failure a NaN gave. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+const DECODE_TIMEOUT_MS = envInt('LURKER_PREVIEWS_POSTER_TIMEOUT_MS', 5_000, {
+  min: 1,
+  max: MAX_TIMER_MS,
+});
 /** Longest edge of the poster. A card thumbnail, not a frame grab for archival. */
 const POSTER_MAX_EDGE = 640;
 
@@ -50,8 +55,11 @@ const POSTER_MAX_EDGE = 640;
  * OOM killer may well pick node over the child.
  */
 const MAX_FRAME_PIXELS = 7680 * 4320;
-/** The largest single allocation ffmpeg may make. An 8K RGB frame is ~100 MB. */
-const MAX_ALLOC_BYTES = 128 * 1024 * 1024;
+/** The largest single allocation ffmpeg may make. ⚠ An 8K plane of the tone-map chain's
+ *  `gbrpf32le` is 7680×4320×4 = 132.7 MB, and the chain fails outright past the cap — measured:
+ *  128 MiB made an 8K HDR clip ship its UN-tone-mapped fallback. 160 MiB clears it; the frame
+ *  cap above is what bounds the total. */
+const MAX_ALLOC_BYTES = 160 * 1024 * 1024;
 /** The most pixels a poster can be, for sharp's reads of OUR OWN encoder's output: 640² plus
  *  the even-rounding of `force_divisible_by`. Not a cap on the video; a cap on the JPEG. */
 const MAX_POSTER_PIXELS = 2 * POSTER_MAX_EDGE * POSTER_MAX_EDGE;
@@ -183,7 +191,7 @@ const NOTHING: RunResult = { code: null, stdout: Buffer.alloc(0), timedOut: fals
  */
 async function run(bin: string, args: string[], ctx: RunContext = {}): Promise<RunResult> {
   if (ctx.signal?.aborted) return NOTHING;
-  if (!(await decodePool.acquire())) return NOTHING;
+  if (!(await decodePool.acquire(ctx.signal))) return NOTHING;
   try {
     if (ctx.signal?.aborted) return NOTHING;
     return await spawnBounded(bin, args, ctx);
@@ -196,7 +204,12 @@ async function run(bin: string, args: string[], ctx: RunContext = {}): Promise<R
  *  can be seen from a poster. */
 export const runForTests = run;
 
-function spawnBounded(bin: string, args: string[], ctx: RunContext): Promise<RunResult> {
+function spawnBounded(
+  bin: string,
+  args: string[],
+  ctx: RunContext,
+  timeoutMs = DECODE_TIMEOUT_MS,
+): Promise<RunResult> {
   return new Promise((resolve) => {
     const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'ignore'], cwd: ctx.cwd });
     const chunks: Buffer[] = [];
@@ -211,7 +224,7 @@ function spawnBounded(bin: string, args: string[], ctx: RunContext): Promise<Run
     const timer = setTimeout(() => {
       timedOut = true;
       kill();
-    }, DECODE_TIMEOUT_MS);
+    }, timeoutMs);
     const onAbort = (): void => kill();
     ctx.signal?.addEventListener('abort', onAbort, { once: true });
     const finish = (result: RunResult): void => {
@@ -240,11 +253,17 @@ function spawnBounded(bin: string, args: string[], ctx: RunContext): Promise<Run
  *  dev may not, and the difference must be a missing poster rather than a failing resolve. */
 let ffmpegPresent: Promise<boolean> | null = null;
 export function ffmpegAvailable(): Promise<boolean> {
-  ffmpegPresent ??= run('ffmpeg', ['-version']).then((r) => {
-    if (r.code !== 0) {
-      console.warn('[previews] ffmpeg not found — video/audio cards will have no posters');
+  // ⚠ Outside the decode pool and its timeout, and cached only when the answer is definitive:
+  // a `-version` that lost a slot or was killed by a busy host's slow start is not "no ffmpeg",
+  // and a false cached here is no posters for the life of the process.
+  ffmpegPresent ??= spawnBounded('ffmpeg', ['-version'], {}, 30_000).then((r) => {
+    if (r.code === 0) return true;
+    if (r.timedOut) {
+      ffmpegPresent = null;
+      return false;
     }
-    return r.code === 0;
+    console.warn('[previews] ffmpeg not found — video/audio cards will have no posters');
+    return false;
   });
   return ffmpegPresent;
 }

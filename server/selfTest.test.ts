@@ -230,6 +230,27 @@ describe('superviseContainment', () => {
   });
 });
 
+describe('superviseContainment under the dev escape hatch', () => {
+  it('warns once and does not keep probing nothing', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const state = { ready: false, reason: 'self-test has not run yet\n' };
+    const sup = superviseContainment(state, {
+      intervalMs: 10,
+      targets: () => [],
+      env: { LURKER_PREVIEWS_ALLOW_PRIVATE: '1' } as NodeJS.ProcessEnv,
+    });
+    try {
+      await sup.first;
+      expect(state.ready).toBe(true);
+      await new Promise((r) => setTimeout(r, 80));
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      sup.stop();
+    }
+  });
+});
+
 /** Listen at exactly `host:port` again — the port was ours a moment ago. */
 async function listenAt(target: string): Promise<{ close: () => Promise<void> }> {
   const parsed = parseTarget(target)!;

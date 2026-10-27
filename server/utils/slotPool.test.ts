@@ -100,3 +100,35 @@ describe('SlotPool', () => {
     expect(pool.inFlight).toBe(0);
   });
 });
+
+describe('SlotPool — an abortable wait', () => {
+  it('drops a queued caller the moment it aborts, freeing its queue place', async () => {
+    // ⚠ An aborted resolve's decode used to sit parked for the full wait, counting against
+    // maxQueued while live callers were refused outright (code review).
+    const pool = new SlotPool({ size: 1, maxQueued: 1, waitMs: 5_000 });
+    expect(await pool.acquire()).toBe(true);
+    const controller = new AbortController();
+    const parked = pool.acquire(controller.signal);
+    expect(pool.queued).toBe(1);
+    // The queue is full: a live caller is refused…
+    expect(await pool.acquire()).toBe(false);
+    controller.abort();
+    expect(await parked).toBe(false);
+    expect(pool.queued).toBe(0);
+    // …and has its place back once the aborted one has left.
+    const live = pool.acquire();
+    expect(pool.queued).toBe(1);
+    pool.release();
+    expect(await live).toBe(true);
+    pool.release();
+  });
+
+  it('refuses at once for a signal already aborted, without touching the queue', async () => {
+    const pool = new SlotPool({ size: 1, maxQueued: 1, waitMs: 5_000 });
+    const controller = new AbortController();
+    controller.abort();
+    expect(await pool.acquire(controller.signal)).toBe(false);
+    expect(pool.inFlight).toBe(0);
+    expect(pool.queued).toBe(0);
+  });
+});
