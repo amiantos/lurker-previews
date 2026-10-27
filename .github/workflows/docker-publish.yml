@@ -39,14 +39,14 @@ jobs:
         run: npm ci --ignore-scripts --omit=dev && npm audit --omit=dev --audit-level=high
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # The Dockerfile's `test` stage runs the full suite — including the ffmpeg poster
       # tests that can only run where ffmpeg lives — so a broken build never reaches the
       # registry. amd64 only: the suite under qemu is minutes of emulation for no added
       # coverage, and the runtime stages below still build both architectures.
       - name: Run the test stage
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           target: test
@@ -56,7 +56,7 @@ jobs:
           platforms: linux/amd64
 
       - name: Log in to Container Registry
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -75,7 +75,7 @@ jobs:
             type=sha,prefix=
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           push: true
