@@ -249,6 +249,239 @@ describe('resolving a page at a live origin', () => {
   });
 });
 
+describe('a redirect written in markup (lurker#1249)', () => {
+  /** The stub Jekyll's `redirect_from` emits: a 200 whose only content is where to go next. */
+  const stub = (to: string) => `<!DOCTYPE html>
+    <html lang="en-US">
+      <meta charset="utf-8">
+      <title>Redirecting&hellip;</title>
+      <link rel="canonical" href="${to}">
+      <script>location="${to}"</script>
+      <meta http-equiv="refresh" content="0; url=${to}">
+      <meta name="robots" content="noindex">
+      <h1>Redirecting&hellip;</h1>
+      <a href="${to}">Click here if you are not redirected.</a>
+    </html>`;
+
+  /** Route by path: a stub at `/old`, the real page at `/new`, whatever else is asked for. */
+  function site(routes: Record<string, (res: http.ServerResponse) => void>): Handler {
+    return (req, res) => {
+      const route = routes[new URL(req.url || '/', 'http://x').pathname];
+      if (route) return route(res);
+      res.writeHead(404, { 'content-type': 'text/html' });
+      res.end('<head><title>Not here</title></head>');
+    };
+  }
+  const html = (body: string) => (res: http.ServerResponse) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(body);
+  };
+
+  it('follows the stub to the page it names and builds the card from THAT', async () => {
+    reset(
+      site({
+        '/old': html(stub(`${base}/new`)),
+        '/new': html(`<head>
+          <meta property="og:title" content="How to make a bug report">
+          <meta property="og:site_name" content="The Wiki">
+        </head>`),
+      }),
+    );
+
+    const out = await resolve(`${base}/old`);
+    expect(out.verdict).toBe('ok');
+    if (out.verdict !== 'ok') return;
+    expect(out.meta.title).toBe('How to make a bug report');
+    expect(out.meta.siteName).toBe('The Wiki');
+    expect(hits).toEqual(['/old', '/new']);
+  });
+
+  it('resolves a relative target against the page that was SERVED', async () => {
+    // The pragma on a page reached through an HTTP redirect is relative to where the walk
+    // landed, not where it started — the same rule `og:image` follows.
+    reset((req, res) => {
+      const path = new URL(req.url || '/', 'http://x').pathname;
+      if (path === '/start') {
+        res.writeHead(302, { location: '/docs/old' });
+        return res.end();
+      }
+      if (path === '/docs/old') return html(stub('new'))(res);
+      if (path === '/docs/new') return html('<head><title>Arrived</title></head>')(res);
+      res.writeHead(404);
+      res.end();
+    });
+
+    const out = await resolve(`${base}/start`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('Arrived');
+    expect(hits).toEqual(['/start', '/docs/old', '/docs/new']);
+  });
+
+  it('dispatches on what the target turns out to be, so a stub in front of an image is an image', async () => {
+    const png = await sharp({
+      create: { width: 64, height: 32, channels: 3, background: '#996633' },
+    })
+      .png()
+      .toBuffer();
+    reset(
+      site({
+        '/old': html(stub(`${base}/photo.png`)),
+        '/photo.png': (res) => {
+          res.writeHead(200, { 'content-type': 'image/png' });
+          res.end(png);
+        },
+      }),
+    );
+
+    const out = await resolve(`${base}/old`);
+    expect(out.verdict).toBe('ok');
+    if (out.verdict !== 'ok') return;
+    expect(out.meta.kind).toBe('image');
+    expect(out.meta.imageUrl).toBe(`${base}/photo.png`);
+    expect(out.meta.imageWidth).toBe(64);
+  });
+
+  it('re-vets the target, so a refresh into internal space is refused without a dial', async () => {
+    // The whole reason this is not "just follow it": a `Location` into the VPC is caught by
+    // the per-hop check in safeRequest, and a pragma is the same instruction by another route.
+    reset(site({ '/old': html(stub('http://10.6.6.6/latest/meta-data/')) }));
+
+    const out = await resolve(`${base}/old`);
+    expect(out.verdict).toBe('refused');
+    expect(hits).toEqual(['/old']);
+  });
+
+  it('gives up on a loop the moment it closes, rather than fetching until the budget', async () => {
+    reset(
+      site({
+        '/a': html(stub(`${base}/b`)),
+        '/b': html(stub(`${base}/a`)),
+      }),
+    );
+
+    const out = await resolve(`${base}/a`);
+    expect(out.verdict).toBe('refused');
+    if (out.verdict !== 'refused') return;
+    expect(out.reason).toBe('redirect loop');
+    // /b names /a, which an earlier pass already left. Not fetched a second time.
+    expect(hits).toEqual(['/a', '/b']);
+  });
+
+  it('gives up on a chain of distinct stubs at the depth a chain of Location headers gets', async () => {
+    reset(
+      site({
+        '/1': html(stub(`${base}/2`)),
+        '/2': html(stub(`${base}/3`)),
+        '/3': html(stub(`${base}/4`)),
+        '/4': html(stub(`${base}/5`)),
+        '/5': html('<head><title>Never reached</title></head>'),
+      }),
+    );
+
+    const out = await resolve(`${base}/1`);
+    expect(out.verdict).toBe('refused');
+    if (out.verdict !== 'refused') return;
+    expect(out.reason).toBe('too many redirects');
+    // The entry plus MAX_REDIRECTS hops, as safeRequest allows a header chain.
+    expect(hits).toEqual(['/1', '/2', '/3', '/4']);
+  });
+
+  it('scrapes the page when the target is not a web URL, such as an app-store handoff', async () => {
+    // An app landing page hands a phone off to the store with a pragma and keeps perfectly good
+    // og: tags for everyone else. Not followable, so not a reason to refuse — or to lose the card.
+    reset(
+      site({
+        '/app': html(`<head>
+          <meta http-equiv="refresh" content="0; url=itms-apps://itunes.apple.com/app/id1">
+          <meta property="og:title" content="Get the app">
+        </head>`),
+      }),
+    );
+
+    const out = await resolve(`${base}/app`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('Get the app');
+    expect(hits).toEqual(['/app']);
+  });
+
+  it('scrapes a page that will move on after a long delay, since the reader linked THIS page', async () => {
+    reset(
+      site({
+        '/story': html(`<head>
+          <meta http-equiv="refresh" content="300; url=/">
+          <meta property="og:title" content="The story">
+        </head>`),
+      }),
+    );
+
+    const out = await resolve(`${base}/story`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('The story');
+    expect(hits).toEqual(['/story']);
+  });
+
+  it('follows a target that differs only in its query, since that can be another document', async () => {
+    reset((req, res) => {
+      const article = new URL(req.url || '/', 'http://x').searchParams.get('article');
+      if (article === 'old') return html(stub('/index.php?article=new'))(res);
+      html('<head><meta property="og:title" content="The new article"></head>')(res);
+    });
+
+    const out = await resolve(`${base}/index.php?article=old`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('The new article');
+    expect(hits).toEqual(['/index.php?article=old', '/index.php?article=new']);
+  });
+
+  it('catches a loop that closes through an HTTP redirect, not only through markup', async () => {
+    // `/a` refreshes to `/b`; `/b` 302s back to `/a`. The second pass lands on the stub it
+    // left, and its pragma must not read as a reload of this pass.
+    reset((req, res) => {
+      const path = new URL(req.url || '/', 'http://x').pathname;
+      if (path === '/b') {
+        res.writeHead(302, { location: '/a' });
+        return res.end();
+      }
+      html(stub('/b'))(res);
+    });
+
+    const out = await resolve(`${base}/a`);
+    expect(out.verdict).toBe('refused');
+    if (out.verdict !== 'refused') return;
+    expect(out.reason).toBe('redirect loop');
+    expect(hits).toEqual(['/a', '/b', '/a']);
+  });
+
+  it('reads a refresh back to the URL that redirected us as a reload', async () => {
+    reset((req, res) => {
+      const path = new URL(req.url || '/', 'http://x').pathname;
+      if (path === '/start') {
+        res.writeHead(302, { location: '/live' });
+        return res.end();
+      }
+      html(`<head>
+        <meta http-equiv="refresh" content="0; url=/start">
+        <meta property="og:title" content="Live">
+      </head>`)(res);
+    });
+
+    const out = await resolve(`${base}/start`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('Live');
+    expect(hits).toEqual(['/start', '/live']);
+  });
+
+  it('scrapes a page that refreshes to ITSELF, which is a reload and not a redirect', async () => {
+    reset(
+      site({
+        '/live': html(`<head>
+          <meta http-equiv="refresh" content="5; url=${base}/live#top">
+          <meta property="og:title" content="Scoreboard">
+        </head>`),
+      }),
+    );
+
+    const out = await resolve(`${base}/live`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('Scoreboard');
+    expect(hits).toEqual(['/live']);
+  });
+});
+
 describe('verdicts', () => {
   it('answers `none` for a page with nothing worth showing', async () => {
     reset(serveHtml('<html><head><title></title></head><body>plain</body></html>'));

@@ -43,6 +43,16 @@ export interface ScrapedMeta {
   // A field carried through three PRs on the strength of its own comment is worse than absent.
   /** Discovered `<link rel=alternate type=application/json+oembed>` endpoint. */
   oembedUrl?: string;
+  /**
+   * The target of a `<meta http-equiv="refresh" content="0; url=…">`, when the page names one.
+   *
+   * A redirect expressed in markup instead of a status line. Static-site generators emit a
+   * 200 stub of exactly this shape for a moved page (Jekyll's `redirect_from`, Hugo aliases),
+   * and a browser never shows it — so a card scraped from the stub says "Redirecting…" about a
+   * page the reader will never see (lurker#1249). Raw and relative here; the resolver vets it
+   * and follows it as one more hop of the redirect walk.
+   */
+  refreshUrl?: string;
 }
 
 /** The subset of an oEmbed reply we're willing to act on. */
@@ -542,6 +552,94 @@ function metaCharset(probe: string): string | null {
 }
 
 /**
+ * The longest delay at which a refresh is still a REDIRECT, in seconds.
+ *
+ * The pragma serves two unrelated purposes with one syntax. `content="0; url=/new"` is a moved
+ * page — every static-site generator emits it at zero, and hand-written stubs count down from a
+ * few seconds ("you will be redirected in 5…"). `content="300; url=/"` on an article or
+ * `content="900; url=/logout"` on a dashboard is a page with a life of its own that will
+ * eventually go somewhere else; the reader linked THAT page, will see it for minutes, and a
+ * card built from the homepage or the logout screen is simply wrong about the link. Google's
+ * crawler draws the same line, treating only an immediate refresh as a permanent redirect.
+ *
+ * The number sits in the gap between the two populations — countdowns run single digits,
+ * timeouts run minutes — so it is a boundary between behaviours, not a tuning knob.
+ */
+const MAX_REFRESH_DELAY_S = 10;
+
+/**
+ * A refresh pragma's `content`, parsed: null when it is not a pragma at all, otherwise the URL
+ * it names — or `url: null` for one that names no target we should follow.
+ *
+ * The two nulls are different answers, and `scrapeMeta` needs both: a malformed value is
+ * ignored by a browser, which goes on to honour the next one, while a well-formed reload or
+ * timed navigation is the pragma the browser SCHEDULES, and later ones are dead letters.
+ *
+ * Follows the HTML spec's "shared declarative refresh steps": a delay, a separator (`;`, `,` or
+ * whitespace), an optional `url=` that browsers do not actually require, and a URL that may be
+ * wrapped in either quote. `content="0"` and `content="30"` are a page reloading ITSELF — a live
+ * scoreboard, a queue page — and name nothing; that is the browser's reading of them too, and
+ * it is why the result is "no target" rather than "the page's own URL".
+ *
+ * ⚠ `content` is the DECODED attribute value, and the result is still relative: the resolver
+ * does the absolutising, because only it knows the base — the URL the page was actually SERVED
+ * from, after any HTTP hops.
+ */
+function metaRefreshUrl(content: string): { url: string | null } | null {
+  let i = 0;
+  const n = content.length;
+  const skipWs = (): void => {
+    while (i < n && /\s/.test(content[i])) i++;
+  };
+  skipWs();
+  // The delay: digits, with an optional fractional part. Browsers read `.5` and `5.` alike —
+  // and a value that opens with neither is not a refresh at all, per the spec. That strictness
+  // is load-bearing: `content="moved"` read leniently is a relative URL, and following it turns
+  // a page with a mis-typed pragma into a 404 and a `dead` card.
+  const delayStart = i;
+  while (i < n && /[\d.]/.test(content[i])) i++;
+  if (i === delayStart) return null;
+  // ⚠ And the delay must END at a separator or the end of the value. `0garbage` is not a
+  // zero-second refresh to `garbage`: Blink reads up to the first separator and demands a
+  // number, so a browser ignores the pragma, and following it instead would send a page with a
+  // typo in its head to a 404 and a `dead` card.
+  if (i < n && content[i] !== ';' && content[i] !== ',' && !/\s/.test(content[i])) return null;
+  // `parseFloat` reads the leading number out of `5.`, `.5` and `1.2.3` alike, as a browser does.
+  const delay = Number.parseFloat(content.slice(delayStart, i));
+  if (Number.isNaN(delay)) return null;
+  skipWs();
+  if (i >= n) return { url: null };
+  if (content[i] === ';' || content[i] === ',') i++;
+  skipWs();
+  // `url=` is optional, and so is the `=`: per the spec, `url` followed by anything but `=` is
+  // the START of the URL, not a key — `0; urlshortener/abc` goes to `urlshortener/abc`. So the
+  // position is restored when the key does not complete.
+  const beforeKey = i;
+  if (content.slice(i, i + 3).toLowerCase() === 'url') {
+    i += 3;
+    skipWs();
+    if (content[i] === '=') {
+      i++;
+      skipWs();
+    } else {
+      i = beforeKey;
+    }
+  }
+  let rest = content.slice(i);
+  // A quoted URL ends at its closing quote — or at the end of the value, since a browser
+  // tolerates the unclosed form and so does the markup in the wild.
+  const quote = rest[0];
+  if (quote === '"' || quote === "'") {
+    const close = rest.indexOf(quote, 1);
+    rest = close === -1 ? rest.slice(1) : rest.slice(1, close);
+  }
+  rest = rest.trim();
+  // A target we will not follow is still the pragma the browser scheduled — see the docblock.
+  if (rest.length === 0 || delay > MAX_REFRESH_DELAY_S) return { url: null };
+  return { url: rest };
+}
+
+/**
  * Return a copy that does not retain the document it was sliced out of.
  *
  * ⚠⚠ Not a no-op, however much it looks like one. Slicing a string in V8 yields a SlicedString
@@ -589,6 +687,8 @@ export function scrapeMeta(html: string): ScrapedMeta {
   const images: { url: string; secureUrl?: string; width?: string; height?: string }[] = [];
   let titleText: string | undefined;
   let imageSrc: string | undefined;
+  /** A well-formed refresh pragma has been seen; later ones are not the browser's choice. */
+  let refreshSeen = false;
 
   for (const tag of scanHead(html)) {
     if (tag.name === 'title') {
@@ -599,6 +699,26 @@ export function scrapeMeta(html: string): ScrapedMeta {
     if (tag.name === 'meta') {
       const content = tag.attrs.get('content');
       if (!content) continue;
+      // A refresh is a redirect, not metadata, and it is matched on `http-equiv` alone: a
+      // `<meta name="refresh">` is somebody's custom field. First wins, as a browser's does.
+      // ⚠ Decoded BEFORE parsing, unlike every other field here, because the pragma's own
+      // syntax can be entity-encoded: a template engine's autoescape emits `url=&quot;/new&quot;`,
+      // and a browser sees the quotes while a parser working on the raw value sees `&quot;` and
+      // keeps it as part of the URL. So this field skips the decode pass at the bottom.
+      if ((tag.attrs.get('http-equiv') || '').toLowerCase() === 'refresh') {
+        // ⚠ The first WELL-FORMED pragma is the one the browser schedules, whether or not it
+        // names a target we follow — `content="5"` (a reload) followed by `content="0; url=/x"`
+        // reloads, so a later pragma must not win just because the first gave us nothing to do.
+        // A malformed one is ignored by browsers and here alike, so the slot stays open.
+        if (!refreshSeen) {
+          const pragma = metaRefreshUrl(decodeEntities(content));
+          if (pragma !== null) {
+            refreshSeen = true;
+            if (pragma.url !== null) out.refreshUrl = detach(pragma.url);
+          }
+        }
+        continue;
+      }
       // OG uses `property`, Twitter Card uses `name`, and plenty of sites use the
       // wrong one for both — so read either and route by the key's prefix.
       const key = (tag.attrs.get('property') || tag.attrs.get('name') || '').toLowerCase();

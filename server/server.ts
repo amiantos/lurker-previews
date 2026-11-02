@@ -44,6 +44,8 @@ const resolvePool = new SlotPool({ size: 20, maxQueued: 200, waitMs: 10_000 });
  * separate fetch walks — the provider oEmbed call, the page fetch it falls through to, and the
  * oEmbed endpoint discovered in that page — each of MAX_REDIRECTS + 1 hops at HOP_DEADLINE_MS,
  * so roughly four minutes of holding a slot while every other caller's `acquire` times out.
+ * A page that redirects by `<meta refresh>` starts that chain over at its target, up to
+ * MAX_REDIRECTS more times, so the arithmetic is worse still; this is the bound that holds.
  *
  * ⚠ The deadline ABORTS the work, it doesn't merely stop waiting for it. Racing a promise
  * abandons it, and abandoning is not ending: the fetch keeps its socket for its own hop budget

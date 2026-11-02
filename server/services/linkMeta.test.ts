@@ -175,6 +175,168 @@ describe('scrapeMeta', () => {
     expect(meta.oembedUrl).toBe('https://e.test/oembed?url=x');
   });
 
+  describe('meta refresh', () => {
+    // lurker#1249: a static-site generator's stub for a moved page is a 200 with a `<title>` of
+    // "Redirecting…" and a refresh pragma. The pragma is the only thing on that page worth
+    // reading. Shapes from the HTML spec's declarative refresh steps, which browsers implement.
+    it('reads the target off the stub Jekyll and friends emit', () => {
+      const meta = scrapeMeta(`<!DOCTYPE html>
+        <html lang="en-US">
+          <meta charset="utf-8">
+          <title>Redirecting&hellip;</title>
+          <link rel="canonical" href="https://wiki.example/how-to/bugreport/">
+          <script>location="https://wiki.example/how-to/bugreport/"</script>
+          <meta http-equiv="refresh" content="0; url=https://wiki.example/how-to/bugreport/">
+          <meta name="robots" content="noindex">
+          <h1>Redirecting&hellip;</h1>
+        </html>`);
+      expect(meta.refreshUrl).toBe('https://wiki.example/how-to/bugreport/');
+      // The stub's own title still comes through; the resolver decides which to act on.
+      expect(meta.title).toBe('Redirecting…');
+    });
+
+    it('accepts every separator and quoting the spec tolerates', () => {
+      const shapes = [
+        `0;url=/new`,
+        `0; URL=/new`,
+        `0,url=/new`,
+        `0 url=/new`,
+        `5; url='/new'`,
+        `5; url="/new"`,
+        `0; url="/new`,
+        `  0.5 ;  url = /new  `,
+        `0; /new`,
+      ];
+      // The attribute takes whichever quote the value does not use, so both URL quotings
+      // survive as markup.
+      const read = shapes.map((content) => {
+        const q = content.includes('"') ? "'" : '"';
+        const doc = `<head><meta http-equiv="refresh" content=${q}${content}${q}></head>`;
+        return [content, scrapeMeta(doc).refreshUrl];
+      });
+      expect(read).toEqual(shapes.map((content) => [content, '/new']));
+    });
+
+    it('names no target for a page that merely reloads itself', () => {
+      const shapes = ['0', '30', ' 30 ', '30;', '30; url=', `30; url=''`];
+      const read = shapes.map((content) => {
+        const doc = `<head><meta http-equiv="refresh" content="${content}"></head>`;
+        return [content, scrapeMeta(doc).refreshUrl];
+      });
+      expect(read).toEqual(shapes.map((content) => [content, undefined]));
+    });
+
+    it('is strict about the delay, so a mis-typed pragma is not read as a relative URL', () => {
+      const meta = scrapeMeta(`<head><meta http-equiv="refresh" content="moved"></head>`);
+      expect(meta.refreshUrl).toBeUndefined();
+    });
+
+    it('follows a countdown and leaves a timed reload alone', () => {
+      // Two populations wear one syntax: a moved-page stub counts down from single digits, and
+      // an article auto-advancing to the front page, or a dashboard logging out, waits minutes.
+      // The second is a page the reader actually linked and will see.
+      const shapes: [string, string | undefined][] = [
+        ['0; url=/new', '/new'],
+        ['5; url=/new', '/new'],
+        ['9.5; url=/new', '/new'],
+        ['10; url=/new', '/new'],
+        ['11; url=/new', undefined],
+        ['300; url=/', undefined],
+        ['900; url=/logout', undefined],
+      ];
+      const read = shapes.map(([content]) => {
+        const doc = `<head><meta http-equiv="refresh" content="${content}"></head>`;
+        return [content, scrapeMeta(doc).refreshUrl];
+      });
+      expect(read).toEqual(shapes);
+    });
+
+    it('treats `url` without an `=` as the start of the URL, as the spec does', () => {
+      const meta = scrapeMeta(
+        `<head><meta http-equiv="refresh" content="0; urlshortener/go/abc"></head>`,
+      );
+      expect(meta.refreshUrl).toBe('urlshortener/go/abc');
+    });
+
+    it('decodes the value before reading its syntax, so autoescaped quotes are quotes', () => {
+      const meta = scrapeMeta(
+        `<head><meta http-equiv="refresh" content="0; url=&quot;/new&quot;"></head>`,
+      );
+      expect(meta.refreshUrl).toBe('/new');
+    });
+
+    it('matches the pragma on http-equiv only, case-insensitively', () => {
+      expect(
+        scrapeMeta(`<head><meta http-equiv="Refresh" content="0; url=/a"></head>`).refreshUrl,
+      ).toBe('/a');
+      expect(
+        scrapeMeta(`<head><meta name="refresh" content="0; url=/a"></head>`).refreshUrl,
+      ).toBeUndefined();
+    });
+
+    it('decodes entities in the target once, like the other URL fields', () => {
+      const meta = scrapeMeta(
+        `<head><meta http-equiv="refresh" content="0; url=/new?a=1&amp;b=2&amp;amp;c"></head>`,
+      );
+      expect(meta.refreshUrl).toBe('/new?a=1&b=2&amp;c');
+    });
+
+    it('takes the first pragma when a page carries several', () => {
+      const meta = scrapeMeta(`<head>
+        <meta http-equiv="refresh" content="0; url=/first">
+        <meta http-equiv="refresh" content="0; url=/second">
+      </head>`);
+      expect(meta.refreshUrl).toBe('/first');
+    });
+
+    it('lets a first pragma we do not follow still block the ones after it', () => {
+      // The browser schedules the first well-formed pragma. A reload, or a navigation minutes
+      // away, is what it will do — not the immediate redirect declared further down.
+      for (const first of ['5', '300; url=/home']) {
+        const meta = scrapeMeta(`<head>
+          <meta http-equiv="refresh" content="${first}">
+          <meta http-equiv="refresh" content="0; url=/unrelated">
+        </head>`);
+        expect(meta.refreshUrl).toBeUndefined();
+      }
+    });
+
+    it('lets a malformed pragma be skipped over, as a browser skips it', () => {
+      const meta = scrapeMeta(`<head>
+        <meta http-equiv="refresh" content="soon">
+        <meta http-equiv="refresh" content="0; url=/real">
+      </head>`);
+      expect(meta.refreshUrl).toBe('/real');
+    });
+
+    it('requires a separator after the delay, so `0garbage` is not a URL', () => {
+      const meta = scrapeMeta(`<head>
+        <meta http-equiv="refresh" content="0garbage">
+        <title>Fine page</title>
+      </head>`);
+      expect(meta.refreshUrl).toBeUndefined();
+      expect(meta.title).toBe('Fine page');
+    });
+
+    it('does not read a pragma from inside a comment', () => {
+      const meta = scrapeMeta(`<head>
+        <!-- <meta http-equiv="refresh" content="0; url=/stale"> -->
+        <title>Live</title>
+      </head>`);
+      expect(meta.refreshUrl).toBeUndefined();
+    });
+
+    it('only sees a pragma in the head, which is a known limit and not a rule', () => {
+      // ⚠ A browser honours the pragma wherever it sits, so a hand-written stub that puts it
+      // after body content still previews as the stub. That is `scanHead` stopping at the first
+      // body element — the same limit every og: tag lives under — and the fix is in the scanner,
+      // not here. Pinned so a change to the scanner knows this case comes with it.
+      const meta = scrapeMeta(`<head><title>Moved</title></head>
+        <body><h1>Moved</h1><meta http-equiv="refresh" content="0; url=/late"></body>`);
+      expect(meta.refreshUrl).toBeUndefined();
+    });
+  });
+
   it('ignores the XML oEmbed variant, which we do not parse', () => {
     const meta = scrapeMeta(`<head>
       <link rel="alternate" type="text/xml+oembed" href="https://e.test/oembed.xml">

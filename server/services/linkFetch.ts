@@ -74,8 +74,16 @@ const HOP_DEADLINE_MS = 20_000;
  */
 const STREAM_IDLE_TIMEOUT_MS = 30_000;
 
-/** Redirects followed before giving up. Each hop is re-validated. */
-const MAX_REDIRECTS = 3;
+/**
+ * Redirects followed before giving up. Each hop is re-validated.
+ *
+ * Exported because the resolver applies the same number to a redirect written in MARKUP — a
+ * `<meta http-equiv="refresh">` stub — which `safeRequest` cannot see, since it never reads a
+ * body. Same policy, separate allowance: each pass through the resolver gets a fresh `Location`
+ * walk, so a chain mixing the two is bounded by the resolver's deadline, not by this. What the
+ * number says on either layer is the same thing — a chain longer than this is a loop or a trap.
+ */
+export const MAX_REDIRECTS = 3;
 
 /**
  * How much of an HTML document we read before giving up on finding metadata.
@@ -125,6 +133,25 @@ export function userAgent(): string {
 }
 
 export class UnsafeUrlError extends Error {}
+
+/**
+ * Absolutise a URL that came out of someone else's document or headers, then vet it.
+ *
+ * ⚠ The RESOLVE is inside the try, not just the vet. `new URL('http://[', base)` throws
+ * `ERR_INVALID_URL` while BUILDING normalizeUrl's argument, so normalizeUrl's own try/catch
+ * never sees it — and the input is a stranger's `Location`, `og:image`, oEmbed href or refresh
+ * pragma, so it reaches us as anything at all. Escaping as a raw TypeError makes a caller that
+ * sorts `UnsafeUrlError` from everything else file a bug report against us, or costs a page its
+ * whole preview over one broken href. Null is the one answer for "cannot be followed", whatever
+ * the reason; the caller decides whether that refuses the walk or merely drops the field.
+ */
+export function normalizeRelative(raw: string, base: URL): URL | null {
+  try {
+    return normalizeUrl(new URL(raw, base).toString());
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Parse and vet a URL string before anything dials it.
@@ -428,16 +455,7 @@ export async function safeRequest(start: URL, opts: FetchOptions = {}): Promise<
     // nothing here needs the socket back.
     res.stream.destroy();
     if (hop === MAX_REDIRECTS) throw new UnsafeUrlError('too many redirects');
-    // ⚠ The resolve is inside the try, not just the normalize. `Location: http://[` throws
-    // `ERR_INVALID_URL` while BUILDING normalizeUrl's argument, so its own try/catch never sees
-    // it — and an attacker-controlled header escaping as a raw TypeError makes a caller that
-    // sorts `UnsafeUrlError` from everything else file a bug report against us.
-    let next: URL | null = null;
-    try {
-      next = normalizeUrl(new URL(String(res.headers.location), url).toString());
-    } catch {
-      next = null;
-    }
+    const next = normalizeRelative(String(res.headers.location), url);
     if (!next) throw new UnsafeUrlError('redirect to a disallowed target');
     url = next;
   }

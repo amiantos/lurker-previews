@@ -58,7 +58,7 @@ reaches librsvg however it was served.
 This service fetches from the public internet **and must not be able to reach anything else** —
 not RFC1918, not link-local (the cloud metadata service lives there), not the VPC, not the
 docker host, on either address family. An in-process guard (DNS-pinned, re-vetted per redirect
-hop) enforces that against malicious _input_; the network rules enforce it against a malicious
+hop, `<meta refresh>` included) enforces that against malicious _input_; the network rules enforce it against a malicious
 _process_, which is the threat this container exists to contain.
 
 - Enforce with **DROP rules, not REJECT** — the self-test below needs the signals to differ.
