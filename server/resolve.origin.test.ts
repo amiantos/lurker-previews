@@ -350,7 +350,7 @@ describe('a redirect written in markup (lurker#1249)', () => {
     expect(hits).toEqual(['/old']);
   });
 
-  it('gives up on a loop rather than fetching until the deadline', async () => {
+  it('gives up on a loop the moment it closes, rather than fetching until the budget', async () => {
     reset(
       site({
         '/a': html(stub(`${base}/b`)),
@@ -361,9 +361,92 @@ describe('a redirect written in markup (lurker#1249)', () => {
     const out = await resolve(`${base}/a`);
     expect(out.verdict).toBe('refused');
     if (out.verdict !== 'refused') return;
+    expect(out.reason).toBe('redirect loop');
+    // /b names /a, which an earlier pass already left. Not fetched a second time.
+    expect(hits).toEqual(['/a', '/b']);
+  });
+
+  it('gives up on a chain of distinct stubs at the depth a chain of Location headers gets', async () => {
+    reset(
+      site({
+        '/1': html(stub(`${base}/2`)),
+        '/2': html(stub(`${base}/3`)),
+        '/3': html(stub(`${base}/4`)),
+        '/4': html(stub(`${base}/5`)),
+        '/5': html('<head><title>Never reached</title></head>'),
+      }),
+    );
+
+    const out = await resolve(`${base}/1`);
+    expect(out.verdict).toBe('refused');
+    if (out.verdict !== 'refused') return;
     expect(out.reason).toBe('too many redirects');
-    // MAX_REDIRECTS hops after the entry, same as a chain of Location headers gets.
-    expect(hits).toEqual(['/a', '/b', '/a', '/b']);
+    // The entry plus MAX_REDIRECTS hops, as safeRequest allows a header chain.
+    expect(hits).toEqual(['/1', '/2', '/3', '/4']);
+  });
+
+  it('scrapes the page when the target is not a web URL, such as an app-store handoff', async () => {
+    // An app landing page hands a phone off to the store with a pragma and keeps perfectly good
+    // og: tags for everyone else. Not followable, so not a reason to refuse — or to lose the card.
+    reset(
+      site({
+        '/app': html(`<head>
+          <meta http-equiv="refresh" content="0; url=itms-apps://itunes.apple.com/app/id1">
+          <meta property="og:title" content="Get the app">
+        </head>`),
+      }),
+    );
+
+    const out = await resolve(`${base}/app`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('Get the app');
+    expect(hits).toEqual(['/app']);
+  });
+
+  it('scrapes a page that will move on after a long delay, since the reader linked THIS page', async () => {
+    reset(
+      site({
+        '/story': html(`<head>
+          <meta http-equiv="refresh" content="300; url=/">
+          <meta property="og:title" content="The story">
+        </head>`),
+      }),
+    );
+
+    const out = await resolve(`${base}/story`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('The story');
+    expect(hits).toEqual(['/story']);
+  });
+
+  it('reads a cache-busting reload as a reload, not a chain of new pages', async () => {
+    reset((req, res) => {
+      // Every hit names a new query, as a scoreboard's `?r=<now>` would.
+      html(`<head>
+        <meta http-equiv="refresh" content="5; url=/live?r=${hits.length}">
+        <meta property="og:title" content="Scoreboard">
+      </head>`)(res);
+    });
+
+    const out = await resolve(`${base}/live`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('Scoreboard');
+    expect(hits).toEqual(['/live']);
+  });
+
+  it('reads a refresh back to the URL that redirected us as a reload', async () => {
+    reset((req, res) => {
+      const path = new URL(req.url || '/', 'http://x').pathname;
+      if (path === '/start') {
+        res.writeHead(302, { location: '/live' });
+        return res.end();
+      }
+      html(`<head>
+        <meta http-equiv="refresh" content="0; url=/start">
+        <meta property="og:title" content="Live">
+      </head>`)(res);
+    });
+
+    const out = await resolve(`${base}/start`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('Live');
+    expect(hits).toEqual(['/start', '/live']);
   });
 
   it('scrapes a page that refreshes to ITSELF, which is a reload and not a redirect', async () => {

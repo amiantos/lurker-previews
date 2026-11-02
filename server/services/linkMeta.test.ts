@@ -231,6 +231,40 @@ describe('scrapeMeta', () => {
       expect(meta.refreshUrl).toBeUndefined();
     });
 
+    it('follows a countdown and leaves a timed reload alone', () => {
+      // Two populations wear one syntax: a moved-page stub counts down from single digits, and
+      // an article auto-advancing to the front page, or a dashboard logging out, waits minutes.
+      // The second is a page the reader actually linked and will see.
+      const shapes: [string, string | undefined][] = [
+        ['0; url=/new', '/new'],
+        ['5; url=/new', '/new'],
+        ['9.5; url=/new', '/new'],
+        ['10; url=/new', '/new'],
+        ['11; url=/new', undefined],
+        ['300; url=/', undefined],
+        ['900; url=/logout', undefined],
+      ];
+      const read = shapes.map(([content]) => {
+        const doc = `<head><meta http-equiv="refresh" content="${content}"></head>`;
+        return [content, scrapeMeta(doc).refreshUrl];
+      });
+      expect(read).toEqual(shapes);
+    });
+
+    it('treats `url` without an `=` as the start of the URL, as the spec does', () => {
+      const meta = scrapeMeta(
+        `<head><meta http-equiv="refresh" content="0; urlshortener/go/abc"></head>`,
+      );
+      expect(meta.refreshUrl).toBe('urlshortener/go/abc');
+    });
+
+    it('decodes the value before reading its syntax, so autoescaped quotes are quotes', () => {
+      const meta = scrapeMeta(
+        `<head><meta http-equiv="refresh" content="0; url=&quot;/new&quot;"></head>`,
+      );
+      expect(meta.refreshUrl).toBe('/new');
+    });
+
     it('matches the pragma on http-equiv only, case-insensitively', () => {
       expect(
         scrapeMeta(`<head><meta http-equiv="Refresh" content="0; url=/a"></head>`).refreshUrl,
@@ -255,11 +289,21 @@ describe('scrapeMeta', () => {
       expect(meta.refreshUrl).toBe('/first');
     });
 
-    it('does not read a pragma from inside a comment or the body', () => {
+    it('does not read a pragma from inside a comment', () => {
       const meta = scrapeMeta(`<head>
         <!-- <meta http-equiv="refresh" content="0; url=/stale"> -->
         <title>Live</title>
-      </head><body><meta http-equiv="refresh" content="0; url=/late"></body>`);
+      </head>`);
+      expect(meta.refreshUrl).toBeUndefined();
+    });
+
+    it('only sees a pragma in the head, which is a known limit and not a rule', () => {
+      // ⚠ A browser honours the pragma wherever it sits, so a hand-written stub that puts it
+      // after body content still previews as the stub. That is `scanHead` stopping at the first
+      // body element — the same limit every og: tag lives under — and the fix is in the scanner,
+      // not here. Pinned so a change to the scanner knows this case comes with it.
+      const meta = scrapeMeta(`<head><title>Moved</title></head>
+        <body><h1>Moved</h1><meta http-equiv="refresh" content="0; url=/late"></body>`);
       expect(meta.refreshUrl).toBeUndefined();
     });
   });

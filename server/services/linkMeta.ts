@@ -552,20 +552,33 @@ function metaCharset(probe: string): string | null {
 }
 
 /**
- * The URL named by a refresh pragma's `content`, or null when it names none.
+ * The longest delay at which a refresh is still a REDIRECT, in seconds.
  *
- * Follows the HTML spec's "shared declarative refresh steps": an optional delay, a separator
- * (`;`, `,` or whitespace), an optional `url=` that browsers do not actually require, and a URL
- * that may be wrapped in either quote. `content="0"` and `content="30"` are a page reloading
- * ITSELF — a live scoreboard, a queue page — and name nothing; that is the browser's reading of
- * them too, and it is why the result is "no target" rather than "the page's own URL".
+ * The pragma serves two unrelated purposes with one syntax. `content="0; url=/new"` is a moved
+ * page — every static-site generator emits it at zero, and hand-written stubs count down from a
+ * few seconds ("you will be redirected in 5…"). `content="300; url=/"` on an article or
+ * `content="900; url=/logout"` on a dashboard is a page with a life of its own that will
+ * eventually go somewhere else; the reader linked THAT page, will see it for minutes, and a
+ * card built from the homepage or the logout screen is simply wrong about the link. Google's
+ * crawler draws the same line, treating only an immediate refresh as a permanent redirect.
  *
- * The delay is read and ignored. A redirect that fires after five seconds is still a redirect,
- * and the reader of a preview card is not going to sit through the countdown either way.
+ * The number sits in the gap between the two populations — countdowns run single digits,
+ * timeouts run minutes — so it is a boundary between behaviours, not a tuning knob.
+ */
+const MAX_REFRESH_DELAY_S = 10;
+
+/**
+ * The URL named by a refresh pragma's `content`, or null when it names none we should follow.
  *
- * ⚠ Returned RAW: entities still encoded, relative still relative. The caller decodes once at
- * its boundary with the other URL fields, and the resolver does the absolutising, because only
- * it knows the base — the URL the page was actually SERVED from, after any HTTP hops.
+ * Follows the HTML spec's "shared declarative refresh steps": a delay, a separator (`;`, `,` or
+ * whitespace), an optional `url=` that browsers do not actually require, and a URL that may be
+ * wrapped in either quote. `content="0"` and `content="30"` are a page reloading ITSELF — a live
+ * scoreboard, a queue page — and name nothing; that is the browser's reading of them too, and
+ * it is why the result is "no target" rather than "the page's own URL".
+ *
+ * ⚠ `content` is the DECODED attribute value, and the result is still relative: the resolver
+ * does the absolutising, because only it knows the base — the URL the page was actually SERVED
+ * from, after any HTTP hops.
  */
 function metaRefreshUrl(content: string): string | null {
   let i = 0;
@@ -581,15 +594,26 @@ function metaRefreshUrl(content: string): string | null {
   const delayStart = i;
   while (i < n && /[\d.]/.test(content[i])) i++;
   if (i === delayStart) return null;
+  // `parseFloat` reads the leading number out of `5.`, `.5` and `1.2.3` alike, as a browser does.
+  const delay = Number.parseFloat(content.slice(delayStart, i));
+  if (!(delay <= MAX_REFRESH_DELAY_S)) return null;
   skipWs();
   if (i >= n) return null;
   if (content[i] === ';' || content[i] === ',') i++;
   skipWs();
+  // `url=` is optional, and so is the `=`: per the spec, `url` followed by anything but `=` is
+  // the START of the URL, not a key — `0; urlshortener/abc` goes to `urlshortener/abc`. So the
+  // position is restored when the key does not complete.
+  const beforeKey = i;
   if (content.slice(i, i + 3).toLowerCase() === 'url') {
     i += 3;
     skipWs();
-    if (content[i] === '=') i++;
-    skipWs();
+    if (content[i] === '=') {
+      i++;
+      skipWs();
+    } else {
+      i = beforeKey;
+    }
   }
   let rest = content.slice(i);
   // A quoted URL ends at its closing quote — or at the end of the value, since a browser
@@ -663,10 +687,14 @@ export function scrapeMeta(html: string): ScrapedMeta {
       if (!content) continue;
       // A refresh is a redirect, not metadata, and it is matched on `http-equiv` alone: a
       // `<meta name="refresh">` is somebody's custom field. First wins, as a browser's does.
+      // ⚠ Decoded BEFORE parsing, unlike every other field here, because the pragma's own
+      // syntax can be entity-encoded: a template engine's autoescape emits `url=&quot;/new&quot;`,
+      // and a browser sees the quotes while a parser working on the raw value sees `&quot;` and
+      // keeps it as part of the URL. So this field skips the decode pass at the bottom.
       if ((tag.attrs.get('http-equiv') || '').toLowerCase() === 'refresh') {
         if (out.refreshUrl === undefined) {
-          const target = metaRefreshUrl(content);
-          if (target !== null) out.refreshUrl = target;
+          const target = metaRefreshUrl(decodeEntities(content));
+          if (target !== null) out.refreshUrl = detach(target);
         }
         continue;
       }
@@ -778,7 +806,7 @@ export function scrapeMeta(html: string): ScrapedMeta {
     if (clean) out[k] = clean;
     else delete out[k];
   }
-  for (const k of ['imageUrl', 'oembedUrl', 'refreshUrl'] as const) {
+  for (const k of ['imageUrl', 'oembedUrl'] as const) {
     const v = out[k];
     if (v === undefined) continue;
     const clean = detach(decodeEntities(v).trim());

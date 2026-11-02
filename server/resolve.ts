@@ -33,6 +33,7 @@ import {
   bufferStream,
   fetchBuffered,
   normalizeUrl,
+  normalizeRelative,
   safeRequest,
   MAX_REDIRECTS,
   MAX_SCRAPE_BYTES,
@@ -163,18 +164,9 @@ async function fetchOEmbed(
   base: URL,
   signal: AbortSignal,
 ): Promise<ReturnType<typeof readOEmbed>> {
-  // ⚠ The RESOLVE is inside the try, not just the normalize — the same shape `safeRequest`
-  // needed for a redirect `Location`. `raw` is an href scraped out of a stranger's markup, and
-  // `new URL('http://[', base)` throws ERR_INVALID_URL while BUILDING normalizeUrl's argument,
-  // so normalizeUrl's own guard never sees it. Escaping as a raw TypeError would abandon the
-  // whole page — a broken oEmbed href would cost a site its preview entirely, when oEmbed is
-  // the fallback path and skipping it should leave the Open Graph tags we already have.
-  let url: URL | null = null;
-  try {
-    url = normalizeUrl(new URL(raw, base).toString());
-  } catch {
-    return null;
-  }
+  // A broken oEmbed href must not cost a site its preview: oEmbed is the fallback path, and
+  // skipping it leaves the Open Graph tags we already have.
+  const url = normalizeRelative(raw, base);
   if (!url) return null;
   try {
     const res = await fetchBuffered(url, {
@@ -218,14 +210,7 @@ export function pageMeta(
    */
   const absolutise = (candidate: string | undefined): string | null => {
     if (!candidate) return null;
-    let abs: URL | null = null;
-    try {
-      abs = normalizeUrl(new URL(candidate, url).toString());
-    } catch {
-      // `new URL` throws on input `normalizeUrl` would merely refuse — and this input came
-      // from a stranger's markup, so it reaches us as anything at all.
-      return null;
-    }
+    const abs = normalizeRelative(candidate, url);
     if (!abs) return null;
     const str = abs.toString();
     return str.length <= MAX_URL_LENGTH ? str : null;
@@ -281,6 +266,56 @@ export function pageMeta(
 }
 
 /**
+ * Where a page's refresh pragma sends us, or why it does not.
+ *
+ *   - `null`: nothing to follow. No pragma, a target that is not a web URL (`itms-apps://`,
+ *     `intent://`, `mailto:` — an app landing page handing off to a store, with perfectly good
+ *     og: tags around it), one that does not parse at all, or one that names the page ITSELF.
+ *     The spec's own reading of an unparseable target is "no refresh", and a browser left on
+ *     such a page shows the page — so we scrape it as it stands.
+ *   - `'refused'`: an http(s) target the guard will not dial. The same answer `safeRequest`
+ *     gives a `Location` into internal space, because it is the same instruction by another
+ *     route, and it must not quietly degrade into "preview the stub instead".
+ *   - `'loop'`: a target this walk already LEFT by following a pragma — an earlier pass's page.
+ *     Fetching it again can only lead back here, so the walk gives up now, with the verdict a
+ *     `Location` loop gets, rather than spending the rest of the budget proving it.
+ *   - a URL: the next hop, vetted.
+ *
+ * "Itself" is judged by origin and path against the URLs THIS pass stood on — the one it was
+ * asked for and the one it was served from — not by string equality with the current URL. A
+ * scoreboard reloading as `/live?r=<now>` (a cache-buster, the common idiom) and a page
+ * refreshing back to the canonical URL that 302'd us here are both reloads, and compared
+ * literally each one spent the whole hop budget on one document and then reported "too many
+ * redirects" about a page that was fine.
+ */
+function refreshTarget(
+  raw: string | undefined,
+  base: URL,
+  thisPass: ReadonlySet<string>,
+  earlierPasses: ReadonlySet<string>,
+): URL | 'refused' | 'loop' | null {
+  if (raw === undefined) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw, base);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  const next = normalizeRelative(raw, base);
+  if (!next) return 'refused';
+  const id = pageIdentity(next);
+  if (thisPass.has(id)) return null;
+  if (earlierPasses.has(id)) return 'loop';
+  return next;
+}
+
+/** The part of a URL that says which page it is: origin and path, never query or fragment. */
+function pageIdentity(url: URL): string {
+  return url.origin + url.pathname;
+}
+
+/**
  * Resolve an HTML page into a card by scraping it — or into the next hop, when the page is a
  * redirect written in markup.
  */
@@ -289,6 +324,8 @@ async function resolveScrapedPage(
   body: Buffer,
   charset: string | null,
   signal: AbortSignal,
+  thisPass: ReadonlySet<string>,
+  earlierPasses: ReadonlySet<string>,
 ): Promise<ResolveStep> {
   // ⚠ The declared CHARSET, not the Content-Type header. `decodeBody` used to re-parse
   // `charset=…` out of what it was handed, but what reached it was `RawResponse.contentType`,
@@ -305,19 +342,10 @@ async function resolveScrapedPage(
   // the page was SERVED from, through `normalizeUrl`, failing closed — because it is the same
   // thing arriving by a different header: a stranger's page choosing our next target, and a
   // hop into internal space is the way that goes wrong.
-  if (meta.refreshUrl !== undefined) {
-    let next: URL | null = null;
-    try {
-      next = normalizeUrl(new URL(meta.refreshUrl, url).toString());
-    } catch {
-      next = null;
-    }
-    if (!next) throw new UnsafeUrlError('redirect to a disallowed target');
-    // A page refreshing to ITSELF is a reload, not a redirect — a scoreboard, a queue page.
-    // Followed, it would spend the whole hop budget re-fetching one document and then report
-    // "too many redirects" about a page that was fine. Scraped as it stands instead.
-    if (next.toString() !== url.toString()) return { verdict: 'refresh', url: next };
-  }
+  const next = refreshTarget(meta.refreshUrl, url, thisPass, earlierPasses);
+  if (next === 'refused') throw new UnsafeUrlError('redirect to a disallowed target');
+  if (next === 'loop') throw new UnsafeUrlError('redirect loop');
+  if (next) return { verdict: 'refresh', url: next };
 
   // Discovered oEmbed still wins over the scraped tags where a page advertises one, matching
   // Slack: it's a structured, versioned answer from the site itself rather than a bag of
@@ -413,16 +441,21 @@ async function doResolve(
   const entry = normalizeUrl(raw);
   if (!entry) return { verdict: 'refused', reason: 'disallowed or malformed URL' };
   let url = entry;
+  /** Every page an earlier pass stood on — see `refreshTarget` for what it is compared against. */
+  const earlierPasses = new Set<string>();
   // Each pass is one URL, start to verdict. A page that answers with a `<meta refresh>` sends
-  // us round again at its target, on the same budget `safeRequest` gives a chain of `Location`
-  // headers: the two are one redirect walk that happens to cross a layer, and a chain that
-  // mixes them must not get the sum of two allowances. Every pass holds `RESOLVE_DEADLINE_MS`
-  // in server.ts as its outer bound, so the budget here is about not wasting it, not about
-  // runaway work.
+  // us round again at its target, and gets as many of those as `safeRequest` gives a chain of
+  // `Location` headers. ⚠ The two allowances are SEPARATE, not shared: each pass runs its own
+  // full `Location` walk, so a chain that mixes the layers can cost up to the product of the
+  // two. The bound that actually holds across all of it is `RESOLVE_DEADLINE_MS` in server.ts,
+  // which aborts the whole resolve; the count here exists so a markup loop gives up at the
+  // same depth a header loop does, instead of fetching until that deadline.
   for (let hop = 0; ; hop++) {
-    const step = await resolveOnce(url, signal, wantPoster);
+    const thisPass = new Set<string>([pageIdentity(url)]);
+    const step = await resolveOnce(url, signal, wantPoster, thisPass, earlierPasses);
     if (step.verdict !== 'refresh') return step;
     if (hop === MAX_REDIRECTS) throw new UnsafeUrlError('too many redirects');
+    for (const id of thisPass) earlierPasses.add(id);
     url = step.url;
   }
 }
@@ -431,6 +464,8 @@ async function resolveOnce(
   url: URL,
   signal: AbortSignal,
   wantPoster: boolean,
+  thisPass: Set<string>,
+  earlierPasses: ReadonlySet<string>,
 ): Promise<ResolveStep> {
   // ⚠ Re-checked on the NORMALISED form. The cell gates the request string, but WHATWG
   // percent-encoding expands every non-ASCII byte threefold, so a 2,014-character URL of
@@ -522,7 +557,17 @@ async function resolveOnce(
     maxBytes: MAX_SCRAPE_BYTES,
     stopAtHeadEnd: true,
   });
-  return await resolveScrapedPage(buffered.finalUrl, buffered.body, buffered.charset, signal);
+  // The page was served from `finalUrl`, which this pass stood on too — a refresh back to it
+  // is a reload.
+  thisPass.add(pageIdentity(buffered.finalUrl));
+  return await resolveScrapedPage(
+    buffered.finalUrl,
+    buffered.body,
+    buffered.charset,
+    signal,
+    thisPass,
+    earlierPasses,
+  );
 }
 
 /**
