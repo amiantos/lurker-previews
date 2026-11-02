@@ -34,6 +34,7 @@ import {
   fetchBuffered,
   normalizeUrl,
   safeRequest,
+  MAX_REDIRECTS,
   MAX_SCRAPE_BYTES,
   UnsafeUrlError,
   type RawResponse,
@@ -94,6 +95,16 @@ export type ResolveVerdict =
   | { verdict: 'refused'; reason: string }
   | { verdict: 'dead' }
   | { verdict: 'backoff'; retryAfterS: number };
+
+/**
+ * One pass of the resolver: a verdict, or a page that told us to go somewhere else.
+ *
+ * `refresh` never leaves this module. It is a `<meta http-equiv="refresh">` the scrape found,
+ * already absolutised and vetted, and `doResolve` follows it by starting over at the new URL —
+ * the provider table, the cooldown, the status and content-type dispatch all apply to where the
+ * page SENT us exactly as they did to where the user pointed.
+ */
+type ResolveStep = ResolveVerdict | { verdict: 'refresh'; url: URL };
 
 /**
  * Trim and shorten a scraped string for display.
@@ -269,13 +280,16 @@ export function pageMeta(
   };
 }
 
-/** Resolve an HTML page into a card by scraping it. */
+/**
+ * Resolve an HTML page into a card by scraping it — or into the next hop, when the page is a
+ * redirect written in markup.
+ */
 async function resolveScrapedPage(
   url: URL,
   body: Buffer,
   charset: string | null,
   signal: AbortSignal,
-): Promise<PreviewMeta | null> {
+): Promise<ResolveStep> {
   // ⚠ The declared CHARSET, not the Content-Type header. `decodeBody` used to re-parse
   // `charset=…` out of what it was handed, but what reached it was `RawResponse.contentType`,
   // already stripped to a bare `text/html` — a branch that could never match, so
@@ -285,11 +299,32 @@ async function resolveScrapedPage(
   const html = decodeBody(body, charset);
   const meta = scrapeMeta(html);
 
+  // A refresh pragma is followed BEFORE anything is made of the page, whatever else its head
+  // says: the stub that carries one has a `<title>` ("Redirecting…"), and a browser never
+  // renders it. Vetted exactly as `safeRequest` vets a `Location` — resolved against the URL
+  // the page was SERVED from, through `normalizeUrl`, failing closed — because it is the same
+  // thing arriving by a different header: a stranger's page choosing our next target, and a
+  // hop into internal space is the way that goes wrong.
+  if (meta.refreshUrl !== undefined) {
+    let next: URL | null = null;
+    try {
+      next = normalizeUrl(new URL(meta.refreshUrl, url).toString());
+    } catch {
+      next = null;
+    }
+    if (!next) throw new UnsafeUrlError('redirect to a disallowed target');
+    // A page refreshing to ITSELF is a reload, not a redirect — a scoreboard, a queue page.
+    // Followed, it would spend the whole hop budget re-fetching one document and then report
+    // "too many redirects" about a page that was fine. Scraped as it stands instead.
+    if (next.toString() !== url.toString()) return { verdict: 'refresh', url: next };
+  }
+
   // Discovered oEmbed still wins over the scraped tags where a page advertises one, matching
   // Slack: it's a structured, versioned answer from the site itself rather than a bag of
   // strings. This is the discovery path, for sites not in the provider table.
   const oembed = meta.oembedUrl ? await fetchOEmbed(meta.oembedUrl, url, signal) : null;
-  return pageMeta(url, oembed, meta);
+  const card = pageMeta(url, oembed, meta);
+  return card ? { verdict: 'ok', meta: card } : { verdict: 'none' };
 }
 
 /**
@@ -375,13 +410,35 @@ async function doResolve(
   signal: AbortSignal,
   wantPoster: boolean,
 ): Promise<ResolveVerdict> {
-  const url = normalizeUrl(raw);
-  if (!url) return { verdict: 'refused', reason: 'disallowed or malformed URL' };
+  const entry = normalizeUrl(raw);
+  if (!entry) return { verdict: 'refused', reason: 'disallowed or malformed URL' };
+  let url = entry;
+  // Each pass is one URL, start to verdict. A page that answers with a `<meta refresh>` sends
+  // us round again at its target, on the same budget `safeRequest` gives a chain of `Location`
+  // headers: the two are one redirect walk that happens to cross a layer, and a chain that
+  // mixes them must not get the sum of two allowances. Every pass holds `RESOLVE_DEADLINE_MS`
+  // in server.ts as its outer bound, so the budget here is about not wasting it, not about
+  // runaway work.
+  for (let hop = 0; ; hop++) {
+    const step = await resolveOnce(url, signal, wantPoster);
+    if (step.verdict !== 'refresh') return step;
+    if (hop === MAX_REDIRECTS) throw new UnsafeUrlError('too many redirects');
+    url = step.url;
+  }
+}
+
+async function resolveOnce(
+  url: URL,
+  signal: AbortSignal,
+  wantPoster: boolean,
+): Promise<ResolveStep> {
   // ⚠ Re-checked on the NORMALISED form. The cell gates the request string, but WHATWG
   // percent-encoding expands every non-ASCII byte threefold, so a 2,014-character URL of
   // Cyrillic passes that gate and comes out of `normalizeUrl` at 12,014 — and back in the cell
   // the image URL is stored verbatim and minted into a proxy path a third longer again, past
   // node's own 16 KB header ceiling on the request that would fetch it. Measured, not theorised.
+  // ⚠ And re-checked per hop: a refresh target is a URL the cell never saw, so this is its only
+  // gate.
   if (url.toString().length > MAX_URL_LENGTH) {
     return { verdict: 'refused', reason: 'URL too long once normalised' };
   }
@@ -465,8 +522,7 @@ async function doResolve(
     maxBytes: MAX_SCRAPE_BYTES,
     stopAtHeadEnd: true,
   });
-  const meta = await resolveScrapedPage(buffered.finalUrl, buffered.body, buffered.charset, signal);
-  return meta ? { verdict: 'ok', meta } : { verdict: 'none' };
+  return await resolveScrapedPage(buffered.finalUrl, buffered.body, buffered.charset, signal);
 }
 
 /**

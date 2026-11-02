@@ -175,6 +175,95 @@ describe('scrapeMeta', () => {
     expect(meta.oembedUrl).toBe('https://e.test/oembed?url=x');
   });
 
+  describe('meta refresh', () => {
+    // lurker#1249: a static-site generator's stub for a moved page is a 200 with a `<title>` of
+    // "Redirecting…" and a refresh pragma. The pragma is the only thing on that page worth
+    // reading. Shapes from the HTML spec's declarative refresh steps, which browsers implement.
+    it('reads the target off the stub Jekyll and friends emit', () => {
+      const meta = scrapeMeta(`<!DOCTYPE html>
+        <html lang="en-US">
+          <meta charset="utf-8">
+          <title>Redirecting&hellip;</title>
+          <link rel="canonical" href="https://wiki.example/how-to/bugreport/">
+          <script>location="https://wiki.example/how-to/bugreport/"</script>
+          <meta http-equiv="refresh" content="0; url=https://wiki.example/how-to/bugreport/">
+          <meta name="robots" content="noindex">
+          <h1>Redirecting&hellip;</h1>
+        </html>`);
+      expect(meta.refreshUrl).toBe('https://wiki.example/how-to/bugreport/');
+      // The stub's own title still comes through; the resolver decides which to act on.
+      expect(meta.title).toBe('Redirecting…');
+    });
+
+    it('accepts every separator and quoting the spec tolerates', () => {
+      const shapes = [
+        `0;url=/new`,
+        `0; URL=/new`,
+        `0,url=/new`,
+        `0 url=/new`,
+        `5; url='/new'`,
+        `5; url="/new"`,
+        `0; url="/new`,
+        `  0.5 ;  url = /new  `,
+        `0; /new`,
+      ];
+      // The attribute takes whichever quote the value does not use, so both URL quotings
+      // survive as markup.
+      const read = shapes.map((content) => {
+        const q = content.includes('"') ? "'" : '"';
+        const doc = `<head><meta http-equiv="refresh" content=${q}${content}${q}></head>`;
+        return [content, scrapeMeta(doc).refreshUrl];
+      });
+      expect(read).toEqual(shapes.map((content) => [content, '/new']));
+    });
+
+    it('names no target for a page that merely reloads itself', () => {
+      const shapes = ['0', '30', ' 30 ', '30;', '30; url=', `30; url=''`];
+      const read = shapes.map((content) => {
+        const doc = `<head><meta http-equiv="refresh" content="${content}"></head>`;
+        return [content, scrapeMeta(doc).refreshUrl];
+      });
+      expect(read).toEqual(shapes.map((content) => [content, undefined]));
+    });
+
+    it('is strict about the delay, so a mis-typed pragma is not read as a relative URL', () => {
+      const meta = scrapeMeta(`<head><meta http-equiv="refresh" content="moved"></head>`);
+      expect(meta.refreshUrl).toBeUndefined();
+    });
+
+    it('matches the pragma on http-equiv only, case-insensitively', () => {
+      expect(
+        scrapeMeta(`<head><meta http-equiv="Refresh" content="0; url=/a"></head>`).refreshUrl,
+      ).toBe('/a');
+      expect(
+        scrapeMeta(`<head><meta name="refresh" content="0; url=/a"></head>`).refreshUrl,
+      ).toBeUndefined();
+    });
+
+    it('decodes entities in the target once, like the other URL fields', () => {
+      const meta = scrapeMeta(
+        `<head><meta http-equiv="refresh" content="0; url=/new?a=1&amp;b=2&amp;amp;c"></head>`,
+      );
+      expect(meta.refreshUrl).toBe('/new?a=1&b=2&amp;c');
+    });
+
+    it('takes the first pragma when a page carries several', () => {
+      const meta = scrapeMeta(`<head>
+        <meta http-equiv="refresh" content="0; url=/first">
+        <meta http-equiv="refresh" content="0; url=/second">
+      </head>`);
+      expect(meta.refreshUrl).toBe('/first');
+    });
+
+    it('does not read a pragma from inside a comment or the body', () => {
+      const meta = scrapeMeta(`<head>
+        <!-- <meta http-equiv="refresh" content="0; url=/stale"> -->
+        <title>Live</title>
+      </head><body><meta http-equiv="refresh" content="0; url=/late"></body>`);
+      expect(meta.refreshUrl).toBeUndefined();
+    });
+  });
+
   it('ignores the XML oEmbed variant, which we do not parse', () => {
     const meta = scrapeMeta(`<head>
       <link rel="alternate" type="text/xml+oembed" href="https://e.test/oembed.xml">

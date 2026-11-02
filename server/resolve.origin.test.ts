@@ -249,6 +249,140 @@ describe('resolving a page at a live origin', () => {
   });
 });
 
+describe('a redirect written in markup (lurker#1249)', () => {
+  /** The stub Jekyll's `redirect_from` emits: a 200 whose only content is where to go next. */
+  const stub = (to: string) => `<!DOCTYPE html>
+    <html lang="en-US">
+      <meta charset="utf-8">
+      <title>Redirecting&hellip;</title>
+      <link rel="canonical" href="${to}">
+      <script>location="${to}"</script>
+      <meta http-equiv="refresh" content="0; url=${to}">
+      <meta name="robots" content="noindex">
+      <h1>Redirecting&hellip;</h1>
+      <a href="${to}">Click here if you are not redirected.</a>
+    </html>`;
+
+  /** Route by path: a stub at `/old`, the real page at `/new`, whatever else is asked for. */
+  function site(routes: Record<string, (res: http.ServerResponse) => void>): Handler {
+    return (req, res) => {
+      const route = routes[new URL(req.url || '/', 'http://x').pathname];
+      if (route) return route(res);
+      res.writeHead(404, { 'content-type': 'text/html' });
+      res.end('<head><title>Not here</title></head>');
+    };
+  }
+  const html = (body: string) => (res: http.ServerResponse) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(body);
+  };
+
+  it('follows the stub to the page it names and builds the card from THAT', async () => {
+    reset(
+      site({
+        '/old': html(stub(`${base}/new`)),
+        '/new': html(`<head>
+          <meta property="og:title" content="How to make a bug report">
+          <meta property="og:site_name" content="The Wiki">
+        </head>`),
+      }),
+    );
+
+    const out = await resolve(`${base}/old`);
+    expect(out.verdict).toBe('ok');
+    if (out.verdict !== 'ok') return;
+    expect(out.meta.title).toBe('How to make a bug report');
+    expect(out.meta.siteName).toBe('The Wiki');
+    expect(hits).toEqual(['/old', '/new']);
+  });
+
+  it('resolves a relative target against the page that was SERVED', async () => {
+    // The pragma on a page reached through an HTTP redirect is relative to where the walk
+    // landed, not where it started — the same rule `og:image` follows.
+    reset((req, res) => {
+      const path = new URL(req.url || '/', 'http://x').pathname;
+      if (path === '/start') {
+        res.writeHead(302, { location: '/docs/old' });
+        return res.end();
+      }
+      if (path === '/docs/old') return html(stub('new'))(res);
+      if (path === '/docs/new') return html('<head><title>Arrived</title></head>')(res);
+      res.writeHead(404);
+      res.end();
+    });
+
+    const out = await resolve(`${base}/start`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('Arrived');
+    expect(hits).toEqual(['/start', '/docs/old', '/docs/new']);
+  });
+
+  it('dispatches on what the target turns out to be, so a stub in front of an image is an image', async () => {
+    const png = await sharp({
+      create: { width: 64, height: 32, channels: 3, background: '#996633' },
+    })
+      .png()
+      .toBuffer();
+    reset(
+      site({
+        '/old': html(stub(`${base}/photo.png`)),
+        '/photo.png': (res) => {
+          res.writeHead(200, { 'content-type': 'image/png' });
+          res.end(png);
+        },
+      }),
+    );
+
+    const out = await resolve(`${base}/old`);
+    expect(out.verdict).toBe('ok');
+    if (out.verdict !== 'ok') return;
+    expect(out.meta.kind).toBe('image');
+    expect(out.meta.imageUrl).toBe(`${base}/photo.png`);
+    expect(out.meta.imageWidth).toBe(64);
+  });
+
+  it('re-vets the target, so a refresh into internal space is refused without a dial', async () => {
+    // The whole reason this is not "just follow it": a `Location` into the VPC is caught by
+    // the per-hop check in safeRequest, and a pragma is the same instruction by another route.
+    reset(site({ '/old': html(stub('http://10.6.6.6/latest/meta-data/')) }));
+
+    const out = await resolve(`${base}/old`);
+    expect(out.verdict).toBe('refused');
+    expect(hits).toEqual(['/old']);
+  });
+
+  it('gives up on a loop rather than fetching until the deadline', async () => {
+    reset(
+      site({
+        '/a': html(stub(`${base}/b`)),
+        '/b': html(stub(`${base}/a`)),
+      }),
+    );
+
+    const out = await resolve(`${base}/a`);
+    expect(out.verdict).toBe('refused');
+    if (out.verdict !== 'refused') return;
+    expect(out.reason).toBe('too many redirects');
+    // MAX_REDIRECTS hops after the entry, same as a chain of Location headers gets.
+    expect(hits).toEqual(['/a', '/b', '/a', '/b']);
+  });
+
+  it('scrapes a page that refreshes to ITSELF, which is a reload and not a redirect', async () => {
+    reset(
+      site({
+        '/live': html(`<head>
+          <meta http-equiv="refresh" content="30">
+          <meta http-equiv="refresh" content="30; url=${base}/live">
+          <meta property="og:title" content="Scoreboard">
+        </head>`),
+      }),
+    );
+
+    const out = await resolve(`${base}/live`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('Scoreboard');
+    expect(hits).toEqual(['/live']);
+  });
+});
+
 describe('verdicts', () => {
   it('answers `none` for a page with nothing worth showing', async () => {
     reset(serveHtml('<html><head><title></title></head><body>plain</body></html>'));

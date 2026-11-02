@@ -43,6 +43,16 @@ export interface ScrapedMeta {
   // A field carried through three PRs on the strength of its own comment is worse than absent.
   /** Discovered `<link rel=alternate type=application/json+oembed>` endpoint. */
   oembedUrl?: string;
+  /**
+   * The target of a `<meta http-equiv="refresh" content="0; url=…">`, when the page names one.
+   *
+   * A redirect expressed in markup instead of a status line. Static-site generators emit a
+   * 200 stub of exactly this shape for a moved page (Jekyll's `redirect_from`, Hugo aliases),
+   * and a browser never shows it — so a card scraped from the stub says "Redirecting…" about a
+   * page the reader will never see (lurker#1249). Raw and relative here; the resolver vets it
+   * and follows it as one more hop of the redirect walk.
+   */
+  refreshUrl?: string;
 }
 
 /** The subset of an oEmbed reply we're willing to act on. */
@@ -542,6 +552,58 @@ function metaCharset(probe: string): string | null {
 }
 
 /**
+ * The URL named by a refresh pragma's `content`, or null when it names none.
+ *
+ * Follows the HTML spec's "shared declarative refresh steps": an optional delay, a separator
+ * (`;`, `,` or whitespace), an optional `url=` that browsers do not actually require, and a URL
+ * that may be wrapped in either quote. `content="0"` and `content="30"` are a page reloading
+ * ITSELF — a live scoreboard, a queue page — and name nothing; that is the browser's reading of
+ * them too, and it is why the result is "no target" rather than "the page's own URL".
+ *
+ * The delay is read and ignored. A redirect that fires after five seconds is still a redirect,
+ * and the reader of a preview card is not going to sit through the countdown either way.
+ *
+ * ⚠ Returned RAW: entities still encoded, relative still relative. The caller decodes once at
+ * its boundary with the other URL fields, and the resolver does the absolutising, because only
+ * it knows the base — the URL the page was actually SERVED from, after any HTTP hops.
+ */
+function metaRefreshUrl(content: string): string | null {
+  let i = 0;
+  const n = content.length;
+  const skipWs = (): void => {
+    while (i < n && /\s/.test(content[i])) i++;
+  };
+  skipWs();
+  // The delay: digits, with an optional fractional part. Browsers read `.5` and `5.` alike —
+  // and a value that opens with neither is not a refresh at all, per the spec. That strictness
+  // is load-bearing: `content="moved"` read leniently is a relative URL, and following it turns
+  // a page with a mis-typed pragma into a 404 and a `dead` card.
+  const delayStart = i;
+  while (i < n && /[\d.]/.test(content[i])) i++;
+  if (i === delayStart) return null;
+  skipWs();
+  if (i >= n) return null;
+  if (content[i] === ';' || content[i] === ',') i++;
+  skipWs();
+  if (content.slice(i, i + 3).toLowerCase() === 'url') {
+    i += 3;
+    skipWs();
+    if (content[i] === '=') i++;
+    skipWs();
+  }
+  let rest = content.slice(i);
+  // A quoted URL ends at its closing quote — or at the end of the value, since a browser
+  // tolerates the unclosed form and so does the markup in the wild.
+  const quote = rest[0];
+  if (quote === '"' || quote === "'") {
+    const close = rest.indexOf(quote, 1);
+    rest = close === -1 ? rest.slice(1) : rest.slice(1, close);
+  }
+  rest = rest.trim();
+  return rest.length > 0 ? rest : null;
+}
+
+/**
  * Return a copy that does not retain the document it was sliced out of.
  *
  * ⚠⚠ Not a no-op, however much it looks like one. Slicing a string in V8 yields a SlicedString
@@ -599,6 +661,15 @@ export function scrapeMeta(html: string): ScrapedMeta {
     if (tag.name === 'meta') {
       const content = tag.attrs.get('content');
       if (!content) continue;
+      // A refresh is a redirect, not metadata, and it is matched on `http-equiv` alone: a
+      // `<meta name="refresh">` is somebody's custom field. First wins, as a browser's does.
+      if ((tag.attrs.get('http-equiv') || '').toLowerCase() === 'refresh') {
+        if (out.refreshUrl === undefined) {
+          const target = metaRefreshUrl(content);
+          if (target !== null) out.refreshUrl = target;
+        }
+        continue;
+      }
       // OG uses `property`, Twitter Card uses `name`, and plenty of sites use the
       // wrong one for both — so read either and route by the key's prefix.
       const key = (tag.attrs.get('property') || tag.attrs.get('name') || '').toLowerCase();
@@ -707,7 +778,7 @@ export function scrapeMeta(html: string): ScrapedMeta {
     if (clean) out[k] = clean;
     else delete out[k];
   }
-  for (const k of ['imageUrl', 'oembedUrl'] as const) {
+  for (const k of ['imageUrl', 'oembedUrl', 'refreshUrl'] as const) {
     const v = out[k];
     if (v === undefined) continue;
     const clean = detach(decodeEntities(v).trim());

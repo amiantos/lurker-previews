@@ -74,8 +74,15 @@ const HOP_DEADLINE_MS = 20_000;
  */
 const STREAM_IDLE_TIMEOUT_MS = 30_000;
 
-/** Redirects followed before giving up. Each hop is re-validated. */
-const MAX_REDIRECTS = 3;
+/**
+ * Redirects followed before giving up. Each hop is re-validated.
+ *
+ * Exported because the resolver spends the same budget on a redirect written in MARKUP — a
+ * `<meta http-equiv="refresh">` stub — which `safeRequest` cannot see, since it never reads a
+ * body. One policy for both: a chain longer than this is a loop or a trap, whichever layer it
+ * is expressed at.
+ */
+export const MAX_REDIRECTS = 3;
 
 /**
  * How much of an HTML document we read before giving up on finding metadata.
