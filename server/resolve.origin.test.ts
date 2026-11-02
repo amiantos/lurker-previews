@@ -417,18 +417,35 @@ describe('a redirect written in markup (lurker#1249)', () => {
     expect(hits).toEqual(['/story']);
   });
 
-  it('reads a cache-busting reload as a reload, not a chain of new pages', async () => {
+  it('follows a target that differs only in its query, since that can be another document', async () => {
     reset((req, res) => {
-      // Every hit names a new query, as a scoreboard's `?r=<now>` would.
-      html(`<head>
-        <meta http-equiv="refresh" content="5; url=/live?r=${hits.length}">
-        <meta property="og:title" content="Scoreboard">
-      </head>`)(res);
+      const article = new URL(req.url || '/', 'http://x').searchParams.get('article');
+      if (article === 'old') return html(stub('/index.php?article=new'))(res);
+      html('<head><meta property="og:title" content="The new article"></head>')(res);
     });
 
-    const out = await resolve(`${base}/live`);
-    expect(out.verdict === 'ok' && out.meta.title).toBe('Scoreboard');
-    expect(hits).toEqual(['/live']);
+    const out = await resolve(`${base}/index.php?article=old`);
+    expect(out.verdict === 'ok' && out.meta.title).toBe('The new article');
+    expect(hits).toEqual(['/index.php?article=old', '/index.php?article=new']);
+  });
+
+  it('catches a loop that closes through an HTTP redirect, not only through markup', async () => {
+    // `/a` refreshes to `/b`; `/b` 302s back to `/a`. The second pass lands on the stub it
+    // left, and its pragma must not read as a reload of this pass.
+    reset((req, res) => {
+      const path = new URL(req.url || '/', 'http://x').pathname;
+      if (path === '/b') {
+        res.writeHead(302, { location: '/a' });
+        return res.end();
+      }
+      html(stub('/b'))(res);
+    });
+
+    const out = await resolve(`${base}/a`);
+    expect(out.verdict).toBe('refused');
+    if (out.verdict !== 'refused') return;
+    expect(out.reason).toBe('redirect loop');
+    expect(hits).toEqual(['/a', '/b', '/a']);
   });
 
   it('reads a refresh back to the URL that redirected us as a reload', async () => {
@@ -453,8 +470,7 @@ describe('a redirect written in markup (lurker#1249)', () => {
     reset(
       site({
         '/live': html(`<head>
-          <meta http-equiv="refresh" content="30">
-          <meta http-equiv="refresh" content="30; url=${base}/live">
+          <meta http-equiv="refresh" content="5; url=${base}/live#top">
           <meta property="og:title" content="Scoreboard">
         </head>`),
       }),

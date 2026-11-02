@@ -568,7 +568,12 @@ function metaCharset(probe: string): string | null {
 const MAX_REFRESH_DELAY_S = 10;
 
 /**
- * The URL named by a refresh pragma's `content`, or null when it names none we should follow.
+ * A refresh pragma's `content`, parsed: null when it is not a pragma at all, otherwise the URL
+ * it names — or `url: null` for one that names no target we should follow.
+ *
+ * The two nulls are different answers, and `scrapeMeta` needs both: a malformed value is
+ * ignored by a browser, which goes on to honour the next one, while a well-formed reload or
+ * timed navigation is the pragma the browser SCHEDULES, and later ones are dead letters.
  *
  * Follows the HTML spec's "shared declarative refresh steps": a delay, a separator (`;`, `,` or
  * whitespace), an optional `url=` that browsers do not actually require, and a URL that may be
@@ -580,7 +585,7 @@ const MAX_REFRESH_DELAY_S = 10;
  * does the absolutising, because only it knows the base — the URL the page was actually SERVED
  * from, after any HTTP hops.
  */
-function metaRefreshUrl(content: string): string | null {
+function metaRefreshUrl(content: string): { url: string | null } | null {
   let i = 0;
   const n = content.length;
   const skipWs = (): void => {
@@ -594,11 +599,16 @@ function metaRefreshUrl(content: string): string | null {
   const delayStart = i;
   while (i < n && /[\d.]/.test(content[i])) i++;
   if (i === delayStart) return null;
+  // ⚠ And the delay must END at a separator or the end of the value. `0garbage` is not a
+  // zero-second refresh to `garbage`: Blink reads up to the first separator and demands a
+  // number, so a browser ignores the pragma, and following it instead would send a page with a
+  // typo in its head to a 404 and a `dead` card.
+  if (i < n && content[i] !== ';' && content[i] !== ',' && !/\s/.test(content[i])) return null;
   // `parseFloat` reads the leading number out of `5.`, `.5` and `1.2.3` alike, as a browser does.
   const delay = Number.parseFloat(content.slice(delayStart, i));
-  if (!(delay <= MAX_REFRESH_DELAY_S)) return null;
+  if (Number.isNaN(delay)) return null;
   skipWs();
-  if (i >= n) return null;
+  if (i >= n) return { url: null };
   if (content[i] === ';' || content[i] === ',') i++;
   skipWs();
   // `url=` is optional, and so is the `=`: per the spec, `url` followed by anything but `=` is
@@ -624,7 +634,9 @@ function metaRefreshUrl(content: string): string | null {
     rest = close === -1 ? rest.slice(1) : rest.slice(1, close);
   }
   rest = rest.trim();
-  return rest.length > 0 ? rest : null;
+  // A target we will not follow is still the pragma the browser scheduled — see the docblock.
+  if (rest.length === 0 || delay > MAX_REFRESH_DELAY_S) return { url: null };
+  return { url: rest };
 }
 
 /**
@@ -675,6 +687,8 @@ export function scrapeMeta(html: string): ScrapedMeta {
   const images: { url: string; secureUrl?: string; width?: string; height?: string }[] = [];
   let titleText: string | undefined;
   let imageSrc: string | undefined;
+  /** A well-formed refresh pragma has been seen; later ones are not the browser's choice. */
+  let refreshSeen = false;
 
   for (const tag of scanHead(html)) {
     if (tag.name === 'title') {
@@ -692,9 +706,16 @@ export function scrapeMeta(html: string): ScrapedMeta {
       // and a browser sees the quotes while a parser working on the raw value sees `&quot;` and
       // keeps it as part of the URL. So this field skips the decode pass at the bottom.
       if ((tag.attrs.get('http-equiv') || '').toLowerCase() === 'refresh') {
-        if (out.refreshUrl === undefined) {
-          const target = metaRefreshUrl(decodeEntities(content));
-          if (target !== null) out.refreshUrl = detach(target);
+        // ⚠ The first WELL-FORMED pragma is the one the browser schedules, whether or not it
+        // names a target we follow — `content="5"` (a reload) followed by `content="0; url=/x"`
+        // reloads, so a later pragma must not win just because the first gave us nothing to do.
+        // A malformed one is ignored by browsers and here alike, so the slot stays open.
+        if (!refreshSeen) {
+          const pragma = metaRefreshUrl(decodeEntities(content));
+          if (pragma !== null) {
+            refreshSeen = true;
+            if (pragma.url !== null) out.refreshUrl = detach(pragma.url);
+          }
         }
         continue;
       }

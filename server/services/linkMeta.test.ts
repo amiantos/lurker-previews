@@ -289,6 +289,35 @@ describe('scrapeMeta', () => {
       expect(meta.refreshUrl).toBe('/first');
     });
 
+    it('lets a first pragma we do not follow still block the ones after it', () => {
+      // The browser schedules the first well-formed pragma. A reload, or a navigation minutes
+      // away, is what it will do — not the immediate redirect declared further down.
+      for (const first of ['5', '300; url=/home']) {
+        const meta = scrapeMeta(`<head>
+          <meta http-equiv="refresh" content="${first}">
+          <meta http-equiv="refresh" content="0; url=/unrelated">
+        </head>`);
+        expect(meta.refreshUrl).toBeUndefined();
+      }
+    });
+
+    it('lets a malformed pragma be skipped over, as a browser skips it', () => {
+      const meta = scrapeMeta(`<head>
+        <meta http-equiv="refresh" content="soon">
+        <meta http-equiv="refresh" content="0; url=/real">
+      </head>`);
+      expect(meta.refreshUrl).toBe('/real');
+    });
+
+    it('requires a separator after the delay, so `0garbage` is not a URL', () => {
+      const meta = scrapeMeta(`<head>
+        <meta http-equiv="refresh" content="0garbage">
+        <title>Fine page</title>
+      </head>`);
+      expect(meta.refreshUrl).toBeUndefined();
+      expect(meta.title).toBe('Fine page');
+    });
+
     it('does not read a pragma from inside a comment', () => {
       const meta = scrapeMeta(`<head>
         <!-- <meta http-equiv="refresh" content="0; url=/stale"> -->

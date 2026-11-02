@@ -281,12 +281,17 @@ export function pageMeta(
  *     `Location` loop gets, rather than spending the rest of the budget proving it.
  *   - a URL: the next hop, vetted.
  *
- * "Itself" is judged by origin and path against the URLs THIS pass stood on — the one it was
- * asked for and the one it was served from — not by string equality with the current URL. A
- * scoreboard reloading as `/live?r=<now>` (a cache-buster, the common idiom) and a page
- * refreshing back to the canonical URL that 302'd us here are both reloads, and compared
- * literally each one spent the whole hop budget on one document and then reported "too many
- * redirects" about a page that was fine.
+ * "Itself" is judged against the URLs THIS pass stood on — the one it was asked for and the one
+ * it was served from — not only the current URL: a page refreshing back to the canonical URL
+ * that 302'd us here is a reload, and compared with the served URL alone it spent the whole hop
+ * budget on one document and then reported "too many redirects" about a page that was fine.
+ *
+ * ⚠ The comparison keeps the QUERY. `/index.php?article=old` refreshing to `?article=new` is
+ * two documents, and a `/live` reloading itself as `/live?r=<now>` is one — nothing in the URL
+ * says which, and collapsing the query made the first case preview the stub without ever
+ * fetching the destination. Following is the right default for a target that differs at all;
+ * the cache-busting reload spends the hop budget and refuses, which is the worse outcome for
+ * the rarer page.
  */
 function refreshTarget(
   raw: string | undefined,
@@ -310,9 +315,11 @@ function refreshTarget(
   return next;
 }
 
-/** The part of a URL that says which page it is: origin and path, never query or fragment. */
+/** The part of a URL that says which page it is: everything but the fragment. */
 function pageIdentity(url: URL): string {
-  return url.origin + url.pathname;
+  const id = new URL(url);
+  id.hash = '';
+  return id.toString();
 }
 
 /**
@@ -558,8 +565,13 @@ async function resolveOnce(
     stopAtHeadEnd: true,
   });
   // The page was served from `finalUrl`, which this pass stood on too — a refresh back to it
-  // is a reload.
-  thisPass.add(pageIdentity(buffered.finalUrl));
+  // is a reload. ⚠ Unless an EARLIER pass already stood there: `/a` refreshing to `/b`, which
+  // 302s back to `/a`, has landed on the stub it left, and that stub's pragma to `/b` would
+  // now read as a reload of this pass and hand back the stub's card. A page a pragma already
+  // sent us away from is the loop closing, whichever layer closed it.
+  const landed = pageIdentity(buffered.finalUrl);
+  if (earlierPasses.has(landed)) throw new UnsafeUrlError('redirect loop');
+  thisPass.add(landed);
   return await resolveScrapedPage(
     buffered.finalUrl,
     buffered.body,
