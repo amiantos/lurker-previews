@@ -9,7 +9,7 @@
 # ⚠ Pinned by DIGEST, not tag: a tag is mutable, and an image built from "whatever
 # node:24-slim is today" cannot be reproduced or audited. Dependabot (docker
 # ecosystem, .github/dependabot.yml) moves the digest; a human merges it.
-FROM node:24-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS deps
+FROM node:26-slim@sha256:36793bcbb160a6a16cede1e62b93f84e26b78a972a8a4c0b879c1c12f22761ec AS deps
 
 WORKDIR /app
 
@@ -19,7 +19,7 @@ RUN npm ci --omit=dev
 # Test stage: the full suite in the image's own environment — which is the ONLY
 # environment with ffmpeg guaranteed, so the poster tests that skip on a bare
 # dev machine run for real here. `docker build --target test .` is the gate.
-FROM node:24-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS test
+FROM node:26-slim@sha256:36793bcbb160a6a16cede1e62b93f84e26b78a972a8a4c0b879c1c12f22761ec AS test
 
 WORKDIR /app
 
@@ -41,7 +41,7 @@ COPY server/ ./server/
 RUN npx vitest run
 
 # Runtime image.
-FROM node:24-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
+FROM node:26-slim@sha256:36793bcbb160a6a16cede1e62b93f84e26b78a972a8a4c0b879c1c12f22761ec
 
 WORKDIR /app
 
