@@ -9,6 +9,15 @@ import { describe, it, expect } from 'vitest';
 import sharp from 'sharp';
 import { pageMeta, dimensionsFromHead } from './resolve.js';
 
+async function jpeg(w: number, h: number, orientation?: number) {
+  const img = sharp({ create: { width: w, height: h, channels: 3, background: '#888' } });
+  return await (orientation ? img.withMetadata({ orientation }) : img).jpeg().toBuffer();
+}
+
+// Built from code points: the tooling rewrites a Unicode escape in a string literal as the
+// character itself, and these are the invisible ones.
+const cp = (...codes: number[]): string => String.fromCodePoint(...codes);
+
 describe('pageMeta: what is enough to be worth a card', () => {
   it('keeps a video embed that has neither a title nor an image', () => {
     // ⚠⚠ Regression guard. `!title && !imageUrl` are PAGE concepts, and the give-up rule
@@ -98,11 +107,6 @@ describe('dimensionsFromHead: the numbers a client reserves a box from', () => {
   // ⚠⚠ These are a LAYOUT PROMISE, not a statistic. The client reserves an image's box from this
   // ratio before any bytes arrive (MessageAttachment's `reserveStyle`, lurker#705), so a pair that
   // disagrees with what the browser decodes is a permanently wrong-shaped box rather than a jump.
-  async function jpeg(w: number, h: number, orientation?: number) {
-    const img = sharp({ create: { width: w, height: h, channels: 3, background: '#888' } });
-    return await (orientation ? img.withMetadata({ orientation }) : img).jpeg().toBuffer();
-  }
-
   it('reports what the BROWSER will decode, not what the file stores', async () => {
     // A phone photo shot in portrait: stored landscape, with orientation 6 telling the decoder to
     // rotate it. Browsers honour that (`image-orientation: from-image` is the default) and sharp's
@@ -144,10 +148,6 @@ describe('dimensionsFromHead: the numbers a client reserves a box from', () => {
 });
 
 describe('pageMeta vets every field the cell receives', () => {
-  // Built from code points: the tooling rewrites a Unicode escape in a string literal as the
-  // character itself, and these are the invisible ones.
-  const cp = (...codes: number[]): string => String.fromCodePoint(...codes);
-
   it('strips raw control bytes and bidi overrides from scraped text', () => {
     // ⚠ A literal 0x03 inside the content attribute survived TextDecoder, the whitespace
     // collapse and the clamp: the entity guard only ever refused the numeric reference. The

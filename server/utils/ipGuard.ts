@@ -60,6 +60,26 @@ export function isBlockedIpv4(ip: string): boolean {
   return false;
 }
 
+const pair = (a: number, b: number): string => (((a << 8) | b) >>> 0).toString(16);
+
+/**
+ * One colon-separated run of hex groups, or null if anything in it is malformed.
+ *
+ * ⚠ An empty group is REJECTED rather than dropped. The previous version used
+ * `.filter(g => g !== '')`, which silently accepted every kind of stray colon — a leading
+ * `:1:2:…`, a trailing `…:7:8:`, `:::1` — because the empty pieces just vanished. That's a
+ * parser failing open inside a guard whose whole premise is failing closed.
+ */
+const groupsOf = (part: string): number[] | null => {
+  if (part === '') return [];
+  const out: number[] = [];
+  for (const g of part.split(':')) {
+    if (!/^[0-9a-f]{1,4}$/i.test(g)) return null;
+    out.push(Number.parseInt(g, 16));
+  }
+  return out;
+};
+
 /**
  * Expand an IPv6 literal to its eight 16-bit groups, or null if it isn't one.
  *
@@ -77,27 +97,8 @@ function parseIpv6(input: string): number[] | null {
   if (dotted) {
     const octets = dotted[2].split('.').map(Number);
     if (octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) return null;
-    const pair = (a: number, b: number): string => (((a << 8) | b) >>> 0).toString(16);
     text = `${dotted[1]}${pair(octets[0], octets[1])}:${pair(octets[2], octets[3])}`;
   }
-
-  /**
-   * One colon-separated run of hex groups, or null if anything in it is malformed.
-   *
-   * ⚠ An empty group is REJECTED rather than dropped. The previous version used
-   * `.filter(g => g !== '')`, which silently accepted every kind of stray colon — a leading
-   * `:1:2:…`, a trailing `…:7:8:`, `:::1` — because the empty pieces just vanished. That's a
-   * parser failing open inside a guard whose whole premise is failing closed.
-   */
-  const groupsOf = (part: string): number[] | null => {
-    if (part === '') return [];
-    const out: number[] = [];
-    for (const g of part.split(':')) {
-      if (!/^[0-9a-f]{1,4}$/i.test(g)) return null;
-      out.push(Number.parseInt(g, 16));
-    }
-    return out;
-  };
 
   const halves = text.split('::');
   if (halves.length > 2) return null; // more than one elision — `2001::1::1`

@@ -47,6 +47,14 @@ const PROBE_TIMEOUT_MS = 1_500;
  *  at its IPv4 address and at the IPv6 one AWS answers on when the instance has IPv6. */
 const METADATA_TARGETS = ['169.254.169.254:80', '[fd00:ec2::254]:80'];
 
+const read = (file: string): string | null => {
+  try {
+    return readFileSync(file, 'utf8');
+  } catch {
+    return null; // Not Linux, or an unreadable route table: no gateway to probe.
+  }
+};
+
 /**
  * The container's default gateways — the docker host — read from /proc/net/route and
  * /proc/net/ipv6_route (absent and silently skipped anywhere but Linux, i.e. in local dev).
@@ -59,13 +67,6 @@ const METADATA_TARGETS = ['169.254.169.254:80', '[fd00:ec2::254]:80'];
  * guaranteed to be listening: a probe nothing listens at proves nothing.
  */
 function gatewayTargets(): string[] {
-  const read = (file: string): string | null => {
-    try {
-      return readFileSync(file, 'utf8');
-    } catch {
-      return null; // Not Linux, or an unreadable route table: no gateway to probe.
-    }
-  };
   return gatewayTargetsFrom(read('/proc/net/route'), read('/proc/net/ipv6_route'));
 }
 

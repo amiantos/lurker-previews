@@ -42,12 +42,12 @@ beforeAll(async () => {
     hits.push(req.url || '');
     handler(req, res);
   });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
   base = `http://localhost:${(server.address() as AddressInfo).port}`;
 });
 
 afterAll(async () => {
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  await new Promise<void>((done) => server.close(() => done()));
 });
 
 afterEach(() => {
@@ -72,6 +72,34 @@ function serveHtml(html: string, contentType = 'text/html; charset=utf-8'): Hand
 function resolve(url: string) {
   return resolveUrl(url, new AbortController().signal);
 }
+
+/** The stub Jekyll's `redirect_from` emits: a 200 whose only content is where to go next. */
+const stub = (to: string) => `<!DOCTYPE html>
+    <html lang="en-US">
+      <meta charset="utf-8">
+      <title>Redirecting&hellip;</title>
+      <link rel="canonical" href="${to}">
+      <script>location="${to}"</script>
+      <meta http-equiv="refresh" content="0; url=${to}">
+      <meta name="robots" content="noindex">
+      <h1>Redirecting&hellip;</h1>
+      <a href="${to}">Click here if you are not redirected.</a>
+    </html>`;
+
+/** Route by path: a stub at `/old`, the real page at `/new`, whatever else is asked for. */
+function site(routes: Record<string, (res: http.ServerResponse) => void>): Handler {
+  return (req, res) => {
+    const route = routes[new URL(req.url || '/', 'http://x').pathname];
+    if (route) return route(res);
+    res.writeHead(404, { 'content-type': 'text/html' });
+    res.end('<head><title>Not here</title></head>');
+  };
+}
+
+const html = (body: string) => (res: http.ServerResponse) => {
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+  res.end(body);
+};
 
 describe('resolving a page at a live origin', () => {
   it('scrapes a card in one request, without fetching the image', async () => {
@@ -250,33 +278,6 @@ describe('resolving a page at a live origin', () => {
 });
 
 describe('a redirect written in markup (lurker#1249)', () => {
-  /** The stub Jekyll's `redirect_from` emits: a 200 whose only content is where to go next. */
-  const stub = (to: string) => `<!DOCTYPE html>
-    <html lang="en-US">
-      <meta charset="utf-8">
-      <title>Redirecting&hellip;</title>
-      <link rel="canonical" href="${to}">
-      <script>location="${to}"</script>
-      <meta http-equiv="refresh" content="0; url=${to}">
-      <meta name="robots" content="noindex">
-      <h1>Redirecting&hellip;</h1>
-      <a href="${to}">Click here if you are not redirected.</a>
-    </html>`;
-
-  /** Route by path: a stub at `/old`, the real page at `/new`, whatever else is asked for. */
-  function site(routes: Record<string, (res: http.ServerResponse) => void>): Handler {
-    return (req, res) => {
-      const route = routes[new URL(req.url || '/', 'http://x').pathname];
-      if (route) return route(res);
-      res.writeHead(404, { 'content-type': 'text/html' });
-      res.end('<head><title>Not here</title></head>');
-    };
-  }
-  const html = (body: string) => (res: http.ServerResponse) => {
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(body);
-  };
-
   it('follows the stub to the page it names and builds the card from THAT', async () => {
     reset(
       site({
