@@ -109,6 +109,7 @@ nothing logs.
 | env                                       | meaning                                                                                                           |
 | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `PORT`                                    | listen port, default `8030`                                                                                       |
+| `HOST`                                    | listen host, e.g. `127.0.0.1` or `::1`; unset or empty listens on all interfaces                                  |
 | `LURKER_PREVIEWS_SELFTEST_TARGETS`        | comma-separated `host:port` / `[v6]:port` list of internal addresses that ARE listening and must NOT be reachable |
 | `LURKER_PREVIEWS_SELFTEST_INTERVAL_MS`    | how often the probes repeat, default ten minutes                                                                  |
 | `LURKER_PREVIEWS_ALLOW_PRIVATE`           | `1` skips the self-test — local development only, warns loudly                                                    |
@@ -119,6 +120,10 @@ nothing logs.
 
 Numeric knobs are validated at boot: a value that does not parse as an integer is logged and
 the default used, never `NaN` (which once turned the fetch ceiling off silently).
+
+`HOST` uses Node's listen host lookup; an invalid or unavailable address fails startup.
+The startup log shows the actual bound address, with IPv6 in brackets.
+Restricting the listen host controls inbound access; the outbound containment firewall is still required.
 
 ## Development
 
