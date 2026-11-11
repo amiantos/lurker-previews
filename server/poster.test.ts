@@ -32,6 +32,51 @@ const { resolveUrl } = await import('./resolve.js');
 
 const ffmpegHere = spawnSync('ffmpeg', ['-version']).status === 0;
 
+/** Where the top-level `moov` atom starts, found by walking atoms — not by a byte
+ *  search, which `mdat`'s pixels could satisfy by accident. */
+function moovOffset(buf: Buffer): number {
+  let off = 0;
+  while (off + 8 <= buf.length) {
+    const size = buf.readUInt32BE(off);
+    if (buf.subarray(off + 4, off + 8).toString('latin1') === 'moov') return off;
+    if (size < 8) throw new Error('unexpected atom while walking fixture');
+    off += size;
+  }
+  throw new Error('fixture has no top-level moov');
+}
+
+function atom(type: string, payload = 0): Buffer {
+  const b = Buffer.alloc(8 + payload);
+  b.writeUInt32BE(8 + payload, 0);
+  b.write(type, 4, 'latin1');
+  return b;
+}
+
+/** The value after `name`, in the given slice of the argv. */
+const flag = (args: string[], name: string): string | undefined => {
+  const at = args.indexOf(name);
+  return at === -1 ? undefined : args[at + 1];
+};
+
+async function maxThreads(args: string[]): Promise<{ max: number; samples: number }> {
+  const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'ignore'] });
+  const closed = new Promise<void>((resolve) => child.on('close', () => resolve()));
+  let max = 0;
+  let samples = 0;
+  while (child.exitCode === null && child.signalCode === null) {
+    try {
+      const n = readdirSync(`/proc/${child.pid}/task`).length;
+      samples++;
+      if (n > max) max = n;
+    } catch {
+      // Exited between the check and the read.
+    }
+    await new Promise((r) => setTimeout(r, 1));
+  }
+  await closed;
+  return { max, samples };
+}
+
 /** Make a 1-second test video. `faststart` decides where the moov index lands. */
 function makeVideo(file: string, faststart: boolean): void {
   const args = [
@@ -106,19 +151,6 @@ describe.skipIf(!ffmpegHere)('posters from a live origin', () => {
 
   function poster(opts?: { headBytes?: number; tailBytes?: number }) {
     return posterForUrl(new URL(`${base}/clip.mp4`), new AbortController().signal, opts);
-  }
-
-  /** Where the top-level `moov` atom starts, found by walking atoms — not by a byte
-   *  search, which `mdat`'s pixels could satisfy by accident. */
-  function moovOffset(buf: Buffer): number {
-    let off = 0;
-    while (off + 8 <= buf.length) {
-      const size = buf.readUInt32BE(off);
-      if (buf.subarray(off + 4, off + 8).toString('latin1') === 'moov') return off;
-      if (size < 8) throw new Error('unexpected atom while walking fixture');
-      off += size;
-    }
-    throw new Error('fixture has no top-level moov');
   }
 
   /** A head cap that provably excludes the tail fixture's index while holding the whole
@@ -226,13 +258,6 @@ describe.skipIf(!ffmpegHere)('posters from a live origin', () => {
 
 describe('hasMoovInHead on hand-built atoms', () => {
   // These run everywhere, ffmpeg or not: the walk is pure buffer arithmetic.
-  function atom(type: string, payload = 0): Buffer {
-    const b = Buffer.alloc(8 + payload);
-    b.writeUInt32BE(8 + payload, 0);
-    b.write(type, 4, 'latin1');
-    return b;
-  }
-
   it('finds moov behind other atoms and stops at nonsense sizes', () => {
     expect(hasMoovInHead(Buffer.concat([atom('ftyp', 16), atom('moov', 64)]))).toBe(true);
     expect(hasMoovInHead(Buffer.concat([atom('ftyp', 16), atom('mdat', 64)]))).toBe(false);
@@ -248,6 +273,62 @@ describe('hasMoovInHead on hand-built atoms', () => {
   });
 });
 
+/** A ramp encoded with `transfer` as its declared characteristic. */
+function makeRamp(file: string, transfer: string, primaries: string, matrix: string): void {
+  const out = spawnSync('ffmpeg', [
+    '-nostdin',
+    '-loglevel',
+    'error',
+    '-f',
+    'lavfi',
+    '-i',
+    'gradients=s=320x180:c0=black:c1=white:x0=0:y0=0:x1=320:y1=0:d=1:r=10',
+    '-vf',
+    `setparams=color_trc=${transfer}:color_primaries=${primaries}:colorspace=${matrix}`,
+    '-frames:v',
+    '10',
+    // ⚠ 8-bit, though real HDR is 10. These fixtures are only ever read for their
+    // color_transfer TAG, and forcing 10-bit with no explicit codec asks the default
+    // Matroska encoder for high10 — which a smaller ffmpeg build can lack while decoding
+    // HDR at runtime perfectly well, failing the suite for a reason it does not test.
+    // (Copilot.)
+    '-pix_fmt',
+    'yuv420p',
+    '-color_trc',
+    transfer,
+    '-color_primaries',
+    primaries,
+    '-colorspace',
+    matrix,
+    '-color_range',
+    'tv',
+    '-y',
+    file,
+  ]);
+  if (out.status !== 0) throw new Error(`fixture encode failed: ${out.stderr}`);
+}
+
+function expectColorTags(file: string, transfer: string, primaries: string, matrix: string): void {
+  const probe = spawnSync('ffprobe', [
+    '-v',
+    'error',
+    '-select_streams',
+    'v:0',
+    '-show_entries',
+    'stream=color_transfer,color_primaries,color_space',
+    '-of',
+    'json',
+    file,
+  ]);
+  if (probe.status !== 0) throw new Error(`fixture probe failed: ${probe.stderr}`);
+  const [stream] = JSON.parse(probe.stdout.toString()).streams;
+  expect(stream).toMatchObject({
+    color_transfer: transfer,
+    color_primaries: primaries,
+    color_space: matrix,
+  });
+}
+
 /**
  * ⚠⚠ lurker-previews#1. An HDR frame decoded as though it were bt709 is read off the wrong
  * curve entirely — PQ and HLG both encode luminance quite differently from a gamma ramp —
@@ -257,39 +338,6 @@ describe('hasMoovInHead on hand-built atoms', () => {
  */
 describe.skipIf(!ffmpegHere)('HDR posters', () => {
   let dir: string;
-
-  /** A ramp encoded with `transfer` as its declared characteristic. */
-  function makeRamp(file: string, transfer: string, primaries: string, matrix: string): void {
-    const out = spawnSync('ffmpeg', [
-      '-nostdin',
-      '-loglevel',
-      'error',
-      '-f',
-      'lavfi',
-      '-i',
-      'gradients=s=320x180:c0=black:c1=white:x0=0:y0=0:x1=320:y1=0:d=1:r=10',
-      '-frames:v',
-      '10',
-      // ⚠ 8-bit, though real HDR is 10. These fixtures are only ever read for their
-      // color_transfer TAG, and forcing 10-bit with no explicit codec asks the default
-      // Matroska encoder for high10 — which a smaller ffmpeg build can lack while decoding
-      // HDR at runtime perfectly well, failing the suite for a reason it does not test.
-      // (Copilot.)
-      '-pix_fmt',
-      'yuv420p',
-      '-color_trc',
-      transfer,
-      '-color_primaries',
-      primaries,
-      '-colorspace',
-      matrix,
-      '-color_range',
-      'tv',
-      '-y',
-      file,
-    ]);
-    if (out.status !== 0) throw new Error(`fixture encode failed: ${out.stderr}`);
-  }
 
   beforeAll(async () => {
     dir = await mkdtemp(path.join(tmpdir(), 'poster-hdr-'));
@@ -303,12 +351,14 @@ describe.skipIf(!ffmpegHere)('HDR posters', () => {
 
     const pq = path.join(dir, 'pq.mkv');
     makeRamp(pq, 'smpte2084', 'bt2020', 'bt2020nc');
+    expectColorTags(pq, 'smpte2084', 'bt2020', 'bt2020nc');
     expect(await posterFilter(pq)).toContain('tonemap=');
 
     // ⚠ HLG specifically, because it is what phone cameras record HDR in — and the
     // direction that reads as "too bright", which is how the issue was reported.
     const hlg = path.join(dir, 'hlg.mkv');
     makeRamp(hlg, 'arib-std-b67', 'bt709', 'bt709');
+    expectColorTags(hlg, 'arib-std-b67', 'bt709', 'bt709');
     expect(await posterFilter(hlg)).toContain('tonemap=');
 
     // ⚠⚠ The half that stops this being a regression for everyone else. An SDR clip must
@@ -317,6 +367,7 @@ describe.skipIf(!ffmpegHere)('HDR posters', () => {
     // only make it wrong, and SDR is almost everything.
     const sdr = path.join(dir, 'sdr.mkv');
     makeRamp(sdr, 'bt709', 'bt709', 'bt709');
+    expectColorTags(sdr, 'bt709', 'bt709', 'bt709');
     expect(await posterFilter(sdr)).toBe(
       `scale='min(640,iw)':'min(640,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`,
     );
@@ -327,7 +378,6 @@ describe.skipIf(!ffmpegHere)('HDR posters', () => {
     // here. This is the other half: the tone-mapped chain must actually DECODE in the image
     // ffmpeg ships in. A chain that is correct and unrunnable is a poster nobody gets, and
     // the fallback that covers it is only reachable if this can fail.
-    const { posterForUrl } = await import('./poster.js');
     makeRamp(path.join(dir, 'live.mkv'), 'arib-std-b67', 'bt2020', 'bt2020nc');
     const body = await readFile(path.join(dir, 'live.mkv'));
 
@@ -388,12 +438,6 @@ describe.skipIf(!ffmpegHere)('the tone-map fallback', () => {
 
 describe('the child-process bounds', () => {
   // These run everywhere: the argv is a pure function and `sleep` is on every host.
-
-  /** The value after `name`, in the given slice of the argv. */
-  const flag = (args: string[], name: string): string | undefined => {
-    const at = args.indexOf(name);
-    return at === -1 ? undefined : args[at + 1];
-  };
 
   it('pins the ffmpeg flags: three thread caps, a frame cap, an allocation cap, files only', () => {
     // ⚠⚠ `-threads 2` before `-i` capped the DECODER and nothing else; the filter graph and the
@@ -487,25 +531,6 @@ describe('the child-process bounds', () => {
  * is where threads are counted; the Docker test stage is Linux.
  */
 describe.skipIf(!ffmpegHere || process.platform !== 'linux')('ffmpeg thread count', () => {
-  async function maxThreads(args: string[]): Promise<{ max: number; samples: number }> {
-    const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'ignore'] });
-    const closed = new Promise<void>((resolve) => child.on('close', () => resolve()));
-    let max = 0;
-    let samples = 0;
-    while (child.exitCode === null && child.signalCode === null) {
-      try {
-        const n = readdirSync(`/proc/${child.pid}/task`).length;
-        samples++;
-        if (n > max) max = n;
-      } catch {
-        // Exited between the check and the read.
-      }
-      await new Promise((r) => setTimeout(r, 1));
-    }
-    await closed;
-    return { max, samples };
-  }
-
   // ⚠ The probe is validated against the flags this replaces: the sampler must be able to SEE
   // the per-core pools, or a bound of 8 is a number nothing checked. That needs cores.
   it.skipIf(availableParallelism() < 4)(
