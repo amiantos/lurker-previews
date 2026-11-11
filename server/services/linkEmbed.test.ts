@@ -11,6 +11,10 @@ import {
 
 const embed = (raw: string) => videoEmbedFor(new URL(raw));
 
+const start = (u: string) => new URL(embed(u)!.embedUrl).searchParams.get('start');
+
+const endpoint = (raw: string) => oembedEndpointFor(new URL(raw));
+
 describe('videoEmbedFor — YouTube', () => {
   it('recognises every shape people actually paste', () => {
     for (const raw of [
@@ -44,7 +48,6 @@ describe('videoEmbedFor — YouTube', () => {
     // share dialog emits for any timestamp past a minute — silently became `start=1`. A link
     // shared at 1:30 started the player one second in, with no signal, which is strictly worse
     // than the `?t=notanumber` case below where the guard correctly emits nothing.
-    const start = (u: string) => new URL(embed(u)!.embedUrl).searchParams.get('start');
     expect(start('https://youtu.be/abc123?t=1m30s')).toBe('90');
     expect(start('https://youtu.be/abc123?t=1h2m3s')).toBe('3723');
     expect(start('https://youtu.be/abc123?t=45s')).toBe('45');
@@ -168,8 +171,6 @@ describe('EMBED_ORIGINS / isEmbeddableOrigin', () => {
 });
 
 describe('oembedEndpointFor', () => {
-  const endpoint = (raw: string) => oembedEndpointFor(new URL(raw));
-
   it('knows YouTube, from any shape the link was pasted in', () => {
     // ⚠ This is the whole reason the provider table exists. Measured against the real
     // site: 256 KB of youtube.com HTML read, truncated, and `og:title` NOT PRESENT in it

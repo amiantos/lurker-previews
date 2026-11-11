@@ -14,6 +14,7 @@ import { envInt } from './utils/env.js';
 import { APP_VERSION } from './utils/userAgent.js';
 
 const PORT = envInt('PORT', 8030, { min: 1, max: 65535 });
+const HOST = process.env.HOST || undefined;
 /** How often the egress probes repeat. Ten minutes: a lapsed firewall is a 503 within that. */
 const SELFTEST_INTERVAL_MS = envInt('LURKER_PREVIEWS_SELFTEST_INTERVAL_MS', 10 * 60_000, {
   min: 1,
@@ -23,7 +24,12 @@ const SELFTEST_INTERVAL_MS = envInt('LURKER_PREVIEWS_SELFTEST_INTERVAL_MS', 10 *
 const state: ServerState = { ready: false, reason: 'self-test has not run yet\n' };
 const server = createServer(state);
 
-server.listen(PORT, () => {
-  console.log(`[previews] lurker-previews ${APP_VERSION} listening on :${PORT} (not ready)`);
+server.listen(PORT, HOST, () => {
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP listener');
+  const host = address.family === 'IPv6' ? `[${address.address}]` : address.address;
+  console.log(
+    `[previews] lurker-previews ${APP_VERSION} listening on ${host}:${address.port} (not ready)`,
+  );
   superviseContainment(state, { intervalMs: SELFTEST_INTERVAL_MS });
 });

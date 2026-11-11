@@ -4,6 +4,18 @@
 import { describe, it, expect } from 'vitest';
 import { scrapeMeta, readOEmbed, decodeEntities, decodeBody } from './linkMeta.js';
 
+const scrapeOne = (i: number) => {
+  const pad = 'x'.repeat(512 * 1024);
+  // A single-word site name has no whitespace to collapse, so it never took the accidental
+  // escape route the multi-word text fields relied on — it needed the explicit detach as
+  // much as the URL did.
+  const meta = scrapeMeta(
+    `<head><meta property="og:image" content="https://cdn.test/preview-${i}.png">` +
+      `<meta property="og:site_name" content="GitHub"><!--${pad}--></head>`,
+  );
+  return meta;
+};
+
 describe('decodeEntities', () => {
   it('decodes the named entities that show up in titles', () => {
     expect(decodeEntities('Tom &amp; Jerry')).toBe('Tom & Jerry');
@@ -630,18 +642,6 @@ describe('scrapeMeta', () => {
     // rather than faked — a test that cannot see the bug should say so instead of passing. To
     // run it for real: `node --expose-gc ./node_modules/.bin/vitest run linkMeta`.
     const gc = (globalThis as { gc?: () => void }).gc;
-
-    const scrapeOne = (i: number) => {
-      const pad = 'x'.repeat(512 * 1024);
-      // A single-word site name has no whitespace to collapse, so it never took the accidental
-      // escape route the multi-word text fields relied on — it needed the explicit detach as
-      // much as the URL did.
-      const meta = scrapeMeta(
-        `<head><meta property="og:image" content="https://cdn.test/preview-${i}.png">` +
-          `<meta property="og:site_name" content="GitHub"><!--${pad}--></head>`,
-      );
-      return meta;
-    };
 
     // Correctness of the detach, which every run can check.
     const one = scrapeOne(0);

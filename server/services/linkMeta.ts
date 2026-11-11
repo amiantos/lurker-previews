@@ -898,24 +898,25 @@ function stripLoneSurrogates(text: string): string {
   );
 }
 
+// ⚠ Decoded here, same as scrapeMeta decodes at its own boundary. This was the one metadata
+// path with no `decodeEntities` call — and it is the path built specifically for YouTube,
+// whose oEmbed endpoint HTML-escapes `title` and `author_name`. A video called `Rock & Roll`
+// arrived as `Rock &amp; Roll` and reached the card verbatim: precisely the `Tom &amp; Jerry`
+// failure decodeEntities exists to prevent, on the provider the whole oEmbed detour was
+// built for. Decoding in both places keeps the contract one thing — a caller never handles a
+// raw entity, whichever path produced the value.
+const str = (v: unknown): string | undefined => {
+  if (typeof v !== 'string') return undefined;
+  const clean = detach(stripLoneSurrogates(decodeEntities(v)).replace(/\s+/g, ' ').trim());
+  return clean || undefined;
+};
+
+const num = (v: unknown): number | undefined =>
+  typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined;
+
 export function readOEmbed(json: unknown): OEmbedMeta | null {
   if (typeof json !== 'object' || json === null || Array.isArray(json)) return null;
   const o = json as Record<string, unknown>;
-  // ⚠ Decoded here, same as scrapeMeta decodes at its own boundary. This was the one metadata
-  // path with no `decodeEntities` call — and it is the path built specifically for YouTube,
-  // whose oEmbed endpoint HTML-escapes `title` and `author_name`. A video called `Rock & Roll`
-  // arrived as `Rock &amp; Roll` and reached the card verbatim: precisely the `Tom &amp; Jerry`
-  // failure decodeEntities exists to prevent, on the provider the whole oEmbed detour was
-  // built for. Decoding in both places keeps the contract one thing — a caller never handles a
-  // raw entity, whichever path produced the value.
-  const str = (v: unknown): string | undefined => {
-    if (typeof v !== 'string') return undefined;
-    const clean = detach(stripLoneSurrogates(decodeEntities(v)).replace(/\s+/g, ' ').trim());
-    return clean || undefined;
-  };
-  const num = (v: unknown): number | undefined =>
-    typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined;
-
   return {
     type: str(o.type),
     title: str(o.title),
