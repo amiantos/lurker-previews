@@ -75,7 +75,10 @@ describe('listen host', () => {
   });
 
   it('fails an invalid host without starting containment supervision', async () => {
-    await expect(boot('invalid host!')).rejects.toMatchObject({ code: 'ENOTFOUND' });
+    // ENOTFOUND with a resolver to ask; EAI_AGAIN where there is none (an offline build).
+    await expect(boot('invalid host!')).rejects.toMatchObject({
+      code: expect.stringMatching(/^(ENOTFOUND|EAI_AGAIN)$/),
+    });
     expect(server.listening).toBe(false);
     expect(superviseContainment).not.toHaveBeenCalled();
     expect(console.log).not.toHaveBeenCalled();
